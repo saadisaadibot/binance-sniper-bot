@@ -4,39 +4,50 @@ import requests
 from flask import Flask, request
 
 app = Flask(__name__)
+
+# جلب المتغيرات من البيئة
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 REDIS_URL = os.getenv("REDIS_URL")
+
+# الاتصال بـ Redis
 r = redis.from_url(REDIS_URL)
 
-@app.route("/", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json()
-    if not data or "message" not in data:
-        return "ignored"
-
-    message = data["message"]
-    chat_id = message["chat"]["id"]
-    text = message.get("text", "")
-
-    if text.startswith("سجل "):
-        content = text.replace("سجل", "").strip()
-        if content:
-            r.sadd("test_saves", content.upper())
-            send_message(f"تم حفظ {content.upper()} ✅", chat_id)
-        else:
-            send_message("⚠️ لم يتم تحديد محتوى", chat_id)
-
-    return "ok"
-
-def send_message(text, chat_id):
+# إرسال رسالة تيليغرام (اختياري)
+def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    requests.post(url, data=payload)
+    payload = {"chat_id": CHAT_ID, "text": text}
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        print("💥 Error sending message:", e)
+
 @app.route("/", methods=["POST"])
 def telegram_webhook():
-    print("🔥 Received Telegram Webhook")
-    data = request.get_json()
-    print(data)
+    try:
+        data = request.get_json()
+        print("🔥 Received update:", data)
+
+        message = data.get("message", {})
+        text = message.get("text", "").strip()
+        chat_id = message.get("chat", {}).get("id")
+
+        if text.lower().startswith("سجل"):
+            parts = text.split(" ", 1)
+            if len(parts) == 2:
+                coin = parts[1].strip().upper()
+                r.sadd("saved_coins", coin)
+                send_message(f"✔️ تم تسجيل {coin}")
+            else:
+                send_message("⚠️ اكتب اسم العملة بعد 'سجل'")
+        return "ok"
+    except Exception as e:
+        print("❌ ERROR:", e)
+        return "error", 500
+
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot is running."
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
