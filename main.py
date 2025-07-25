@@ -82,7 +82,7 @@ def watch_best(symbol):
                 return
             price_bitvavo_usd = price_bitvavo * eur_usd
             diff = (price_binance - price_bitvavo_usd) / price_bitvavo_usd * 100
-            if 0 < diff < 50 and diff >= 0.7:
+            if 0 < diff < 50 and diff >= 0.2:
                 print(f"🚀 فرق {diff:.2f}% - {coin}")
                 send_toto(coin)
                 ws.close()
