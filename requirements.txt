@@ -1,3 +1,4 @@
+binance-connector
 flask
 redis
 requests
