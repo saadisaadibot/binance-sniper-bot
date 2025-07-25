@@ -1,157 +1,81 @@
 import os
 import time
-import json
-import redis
-import threading
 import requests
-from flask import Flask, request
-from websocket import WebSocketApp
+import redis
+from threading import Thread
 
-app = Flask(__name__)
+# إعداد Redis
 r = redis.from_url(os.getenv("REDIS_URL"))
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = "https://totozaghnot-production.up.railway.app"
-IS_RUNNING_KEY = "sniper_running"
+HEADERS = {'Content-Type': 'application/json'}
 
-def send_buy_signal(coin):
-    payload = {"message": f"اشتري {coin} يا توتو sniper"}
-    try:
-        requests.post(WEBHOOK_URL, json=payload)
-    except Exception as e:
-        print(f"فشل إرسال الإشعار لتوتو: {e}")
+def get_binance_prices():
+    url = "https://api.binance.com/api/v3/ticker/price"
+    res = requests.get(url).json()
+    return {x['symbol']: float(x['price']) for x in res if x['symbol'].endswith("USDT")}
 
-def fetch_bitvavo_price(symbol):
-    try:
-        url = f"https://api.bitvavo.com/v2/ticker/price?market={symbol}"
-        res = requests.get(url)
-        price = float(res.json()["price"])
-        if price < 0.01: return None  # تجاهل الأسعار الصغيرة جداً
-        return price
-    except:
-        return None
+def get_bitvavo_prices():
+    url = "https://api.bitvavo.com/v2/ticker/price"
+    res = requests.get(url).json()
+    return {x['market'].replace("-EUR", ""): float(x['price']) for x in res if x['market'].endswith("-EUR")}
 
-def get_eur_usd_rate():
-    try:
-        res = requests.get("https://api.exchangerate.host/latest?base=EUR&symbols=USD")
-        return float(res.json()["rates"]["USD"])
-    except:
-        return 1.08
+def get_top_50_binance(binance_prices):
+    changes = []
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    data = requests.get(url).json()
+    for item in data:
+        if item["symbol"].endswith("USDT"):
+            change = float(item.get("priceChangePercent", 0))
+            changes.append((item["symbol"].replace("USDT", ""), change))
+    top_50 = sorted(changes, key=lambda x: x[1], reverse=True)[:50]
+    return [x[0] for x in top_50]
 
-def fetch_binance_price(symbol):
-    try:
-        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-        res = requests.get(url)
-        return float(res.json()["price"])
-    except:
-        return None
+def watch_top_coin(coin, delay_minutes=2):
+    print(f"🎯 أفضل عملة: {coin} 🔍 بدأ التركيز...")
+    start = time.time()
+    while time.time() - start < delay_minutes * 60:
+        binance_price = get_binance_prices().get(coin + "USDT")
+        bitvavo_price = get_bitvavo_prices().get(coin)
+        if binance_price and bitvavo_price and bitvavo_price > 0:
+            diff = ((binance_price - bitvavo_price) / bitvavo_price) * 100
+            print(f"[{coin}] Diff: {diff:.2f}%")
+            if diff >= 3:
+                payload = {"text": f"اشتري {coin} يا توتو sniper"}
+                requests.post(WEBHOOK_URL, json=payload, headers=HEADERS)
+                print("🚀 أُرسِل إشعار الشراء")
+                return
+        time.sleep(2)
+    print("🐰 هرب الأرنب")
 
-def monitor_top_coin(top_coin):
-    coin = top_coin.replace("USDT", "")
-    symbol_bv = f"{coin}-EUR"
-    eur_usd = get_eur_usd_rate()
-
-    print(f"🎯 ببدأ التركيز على: {coin}")
-    best_diff = 0
-
-    for _ in range(120):  # دقيقتين مراقبة
-        if r.get(IS_RUNNING_KEY) != b"1": return
-        binance_price = fetch_binance_price(top_coin)
-        bitvavo_price = fetch_bitvavo_price(symbol_bv)
-        if not binance_price or not bitvavo_price:
-            time.sleep(1)
-            continue
-
-        bitvavo_usd = bitvavo_price * eur_usd
-        diff = ((binance_price - bitvavo_usd) / bitvavo_usd) * 100
-
-        if diff > 50 or diff < 0:  # تجاهل الفروقات الوهمية
-            time.sleep(1)
-            continue
-
-        print(f"[{coin}] Diff: {diff:.2f}%")
-        if diff > 3.5:
-            send_buy_signal(coin)
-            return
-        time.sleep(1)
-
-    print("🐇 هرب الأرنب!")
-    time.sleep(1)
-
-def scan_top_50_loop():
+def sniper_loop():
     while True:
-        if r.get(IS_RUNNING_KEY) != b"1":
-            time.sleep(5)
+        r.flushdb()
+        print("🚀 جاري فحص أفضل 50 عملة...")
+        binance_prices = get_binance_prices()
+        bitvavo_prices = get_bitvavo_prices()
+        top_50 = get_top_50_binance(binance_prices)
+
+        valid_candidates = []
+        for coin in top_50:
+            b_price = binance_prices.get(coin + "USDT")
+            bv_price = bitvavo_prices.get(coin)
+            if b_price and bv_price and bv_price > 0:
+                diff = ((b_price - bv_price) / bv_price) * 100
+                valid_candidates.append((coin, diff))
+                print(f"[{coin}] Diff: {diff:.2f}%")
+
+        if not valid_candidates:
+            print("❌ لا يوجد عملات صالحة للمقارنة")
+            time.sleep(600)
             continue
 
-        try:
-            r.delete("coins")
-            res = requests.get("https://api.binance.com/api/v3/ticker/24hr")
-            coins = sorted(res.json(), key=lambda x: float(x["priceChangePercent"]), reverse=True)
-            top50 = [c["symbol"] for c in coins if c["symbol"].endswith("USDT") and not c["symbol"].endswith("BUSD")][:50]
-            for coin in top50:
-                r.sadd("coins", coin)
+        best = max(valid_candidates, key=lambda x: x[1])
+        best_coin = best[0]
+        best_diff = best[1]
 
-            print("🚀 جارٍ فحص أفضل 50 عملة...")
+        print(f"🎯 أفضل عملة: {best_coin} {best_diff:.2f}%")
+        watch_top_coin(best_coin)
+        time.sleep(2)
 
-            # تحليل الفروقات السريعة
-            best = None
-            best_diff = 0
-            eur_usd = get_eur_usd_rate()
-            for coin in top50:
-                coin_name = coin.replace("USDT", "")
-                bv_symbol = f"{coin_name}-EUR"
-
-                binance_price = fetch_binance_price(coin)
-                bitvavo_price = fetch_bitvavo_price(bv_symbol)
-                if not binance_price or not bitvavo_price:
-                    continue
-
-                bitvavo_usd = bitvavo_price * eur_usd
-                diff = ((binance_price - bitvavo_usd) / bitvavo_usd) * 100
-
-                if diff > 50 or diff < 0: continue  # فلترة القيم الوهمية
-
-                if diff > best_diff:
-                    best_diff = diff
-                    best = coin
-
-                print(f"[{coin_name}] Diff: {diff:.2f}%")
-
-            if best:
-                print(f"🎯 أفضل عملة: {best.replace('USDT','')} {best_diff:.2f}%")
-                monitor_top_coin(best)
-        except Exception as e:
-            print("حدث خطأ في حلقة المراقبة:", e)
-
-@app.route("/")
-def home():
-    return "Sniper Smart Mode™ جاهز", 200
-
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json()
-    text = data.get("message", {}).get("text", "").lower()
-    if text == "play":
-        r.set(IS_RUNNING_KEY, "1")
-        send_message("✅ بدأ سنايبر الذكي.")
-    elif text == "stop":
-        r.set(IS_RUNNING_KEY, "0")
-        send_message("🛑 تم إيقاف سنايبر.")
-    elif text == "السجل":
-        coins = r.smembers("coins")
-        text = "📡 العملات المرصودة:\n" + "\n".join(c.decode().replace("USDT", "") for c in coins)
-        send_message(text)
-    return {"ok": True}
-
-def send_message(text):
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      data={"chat_id": os.getenv("CHAT_ID"), "text": text})
-    except:
-        pass
-
-if __name__ == "__main__":
-    r.set(IS_RUNNING_KEY, "1")
-    r.delete("coins")
-    threading.Thread(target=scan_top_50_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=8080)
+# تشغيل البوت في ثريد منفصل
+Thread(target=sniper_loop).start()
