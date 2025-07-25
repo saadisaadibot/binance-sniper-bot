@@ -59,11 +59,21 @@ def fetch_bitvavo_top_symbols():
         url = "https://api.bitvavo.com/v2/ticker/24h"
         res = requests.get(url)
         data = res.json()
-        eur_coins = [
-            d for d in data
-            if d.get("market", "").endswith("-EUR") and "priceChangePercentage" in d
-        ]
-        sorted_coins = sorted(eur_coins, key=lambda x: float(x["priceChangePercentage"]), reverse=True)
+        eur_coins = [d for d in data if d.get("market", "").endswith("-EUR")]
+
+        for coin in eur_coins:
+            try:
+                open_price = float(coin.get("open", "0"))
+                last_price = float(coin.get("last", "0"))
+                if open_price > 0:
+                    change = ((last_price - open_price) / open_price) * 100
+                    coin["customChange"] = change
+                else:
+                    coin["customChange"] = -999
+            except:
+                coin["customChange"] = -999
+
+        sorted_coins = sorted(eur_coins, key=lambda x: x["customChange"], reverse=True)
         return [coin["market"].replace("-EUR", "") for coin in sorted_coins[:20]]
     except Exception as e:
         print("فشل جلب العملات من Bitvavo:", e)
