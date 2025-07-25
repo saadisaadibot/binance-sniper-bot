@@ -1,3 +1,4 @@
+import websocket
 import os
 import json
 import time
@@ -5,7 +6,6 @@ import redis
 import requests
 import threading
 from flask import Flask, request, jsonify
-from websocket import WebSocketApp
 
 app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
