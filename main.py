@@ -59,9 +59,12 @@ def fetch_bitvavo_top_symbols():
         url = "https://api.bitvavo.com/v2/ticker/24h"
         res = requests.get(url)
         data = res.json()
-        eur_coins = [d for d in data if d["market"].endswith("-EUR")]
+        eur_coins = [
+            d for d in data
+            if d.get("market", "").endswith("-EUR") and "priceChangePercentage" in d
+        ]
         sorted_coins = sorted(eur_coins, key=lambda x: float(x["priceChangePercentage"]), reverse=True)
-        return [coin["market"].replace("-EUR", "") for coin in sorted_coins[:20]]  # top 20
+        return [coin["market"].replace("-EUR", "") for coin in sorted_coins[:20]]
     except Exception as e:
         print("فشل جلب العملات من Bitvavo:", e)
         return []
@@ -86,7 +89,7 @@ def update_symbols_loop():
         for sym in matched:
             r.sadd("coins", f"{sym}USDT")
         send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in matched]))
-        time.sleep(600)  # كل 10 دقائق
+        time.sleep(600)
 
 def watcher_loop():
     watched = set()
@@ -100,7 +103,7 @@ def watcher_loop():
         for sym in new_symbols:
             threading.Thread(target=watch_price, args=(sym,), daemon=True).start()
             watched.add(sym)
-        time.sleep(5)
+        time.sleep(1)
 
 @app.route("/")
 def home():
@@ -114,10 +117,17 @@ def telegram_webhook():
     text = data["message"].get("text", "").strip().lower()
     if text == "play":
         r.set(IS_RUNNING_KEY, "1")
-        send_message("✅ Sniper بدأ التشغيل.")
+        send_message("✅ بدأ التشغيل Sniper.")
     elif text == "stop":
         r.set(IS_RUNNING_KEY, "0")
-        send_message("🛑 Sniper تم إيقافه مؤقتًا.")
+        send_message("🛑 تم إيقاف Sniper مؤقتًا.")
+    elif text == "السجل":
+        coins = r.smembers("coins")
+        coin_list = [c.decode().replace("USDT", "") for c in coins]
+        if coin_list:
+            send_message("📡 العملات المرصودة:\n" + "\n".join(coin_list))
+        else:
+            send_message("🚫 لا توجد عملات قيد المراقبة حالياً.")
     return jsonify(ok=True)
 
 if __name__ == "__main__":
