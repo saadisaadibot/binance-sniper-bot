@@ -132,11 +132,12 @@ def sniper_loop():
                 send_message("🐰 هرب الأرنب..")
             else:
                 send_message("❌ لم يتم العثور على عملة مناسبة.")
-
         except Exception as e:
             print("خطأ في sniper_loop:", e)
 
         time.sleep(600)  # كل 10 دقائق
-        if __name__ == "__main__":
-            threading.Thread(target=sniper_loop).start()
-            app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+
+# ========== تشغيل التطبيق ==========
+if __name__ == "__main__":
+    threading.Thread(target=sniper_loop).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
