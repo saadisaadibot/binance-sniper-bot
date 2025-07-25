@@ -61,7 +61,7 @@ def fetch_bitvavo_top_symbols():
         data = res.json()
         eur_coins = [d for d in data if d["market"].endswith("-EUR")]
         sorted_coins = sorted(eur_coins, key=lambda x: float(x["priceChangePercentage"]), reverse=True)
-        return [coin["market"].replace("-EUR", "") for coin in sorted_coins[:30]]
+        return [coin["market"].replace("-EUR", "") for coin in sorted_coins[:20]]  # top 20
     except Exception as e:
         print("فشل جلب العملات من Bitvavo:", e)
         return []
@@ -85,7 +85,7 @@ def update_symbols_loop():
         matched = [c for c in bitvavo if f"{c}USDT" in binance]
         for sym in matched:
             r.sadd("coins", f"{sym}USDT")
-        print("🔁 تم تحديث العملات:", matched)
+        send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in matched]))
         time.sleep(600)  # كل 10 دقائق
 
 def watcher_loop():
