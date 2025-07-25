@@ -23,16 +23,31 @@ def send_message(text):
     except Exception as e:
         print("فشل إرسال الرسالة:", e)
 
-# مراقبة السعر عبر WebSocket
+# مراقبة السعر عبر # مراقبة السعر عبر WebSocket
 def watch_price(symbol):
     stream = f"{symbol.lower()}@ticker"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
 
+    last_price = None
+    last_time = None
+
     def on_message(ws, message):
+        nonlocal last_price, last_time
         data = json.loads(message)
         price = float(data['c'])
+        now = time.time()
+
         print(f"[{symbol}] السعر الحالي: {price}")
-        # هنا يمكن إضافة شرط القفزة والإشعار
+
+        if last_price is not None and last_time is not None:
+            price_change = (price - last_price) / last_price * 100
+            time_diff = now - last_time
+
+            if price_change >= 2 and time_diff <= 1:
+                send_message(f"🚀 انفجار سريع في {symbol} 📈\nالسعر ارتفع {price_change:.2f}% خلال ثانية!")
+
+        last_price = price
+        last_time = now
 
     def on_error(ws, error):
         print(f"[{symbol}] خطأ:", error)
