@@ -84,7 +84,7 @@ def fetch_bitvavo_top_symbols():
                 coin["customChange"] = -999
 
         sorted_coins = sorted(eur_coins, key=lambda x: x["customChange"], reverse=True)
-        return [coin["market"].replace("-EUR", "").upper() for coin in sorted_coins[:20]]
+        return [coin["market"].replace("-EUR", "").upper() for coin in sorted_coins[:50]]
     except Exception as e:
         print("فشل جلب العملات من Bitvavo:", e)
         return []
