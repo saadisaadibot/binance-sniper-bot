@@ -1,68 +1,90 @@
 import os
-import json
-import time
 import redis
 import requests
-from binance.websocket.spot.websocket_client import SpotWebsocketClient as Client
+import time
+import json
+import threading
+from flask import Flask, request
+from binance.websocket.spot.websocket_client import SpotWebsocketClient as WebSocketClient
 
-# إعدادات البيئة
-TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
-TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
+app = Flask(__name__)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 REDIS_URL = os.getenv("REDIS_URL")
 r = redis.from_url(REDIS_URL)
 
-# دالة إرسال رسالة تيليغرام
+tracked_prices = {}
+
 def send_message(text):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text}
-        )
-    except Exception as e:
-        print("Telegram Error:", e)
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": text})
 
-# حفظ الأسعار السابقة
-last_prices = {}
+def monitor_price(symbol):
+    def handle_message(msg):
+        symbol = msg['s']
+        price = float(msg['c'])
+        now = time.time()
 
-# المعالجة عند وصول بيانات
-def handle_message(msg):
-    try:
-        symbol = msg["s"]
-        price = float(msg["c"])
+        if symbol in tracked_prices:
+            prev_price, prev_time = tracked_prices[symbol]
+            if now - prev_time <= 1:
+                change = (price - prev_price) / prev_price * 100
+                if change >= 2:
+                    send_message(f"🚀 ارتفاع مفاجئ: {symbol} صعدت {change:.2f}% خلال ثانية!")
+        tracked_prices[symbol] = (price, now)
 
-        if symbol not in last_prices:
-            last_prices[symbol] = price
-            return
-
-        old_price = last_prices[symbol]
-        change_percent = ((price - old_price) / old_price) * 100
-
-        if change_percent >= 2:
-            coin = symbol.replace("USDT", "")
-            send_message(f"🚀 انفجار {coin}: ارتفعت 2% خلال ثانية")
-            print(f"تم إرسال إشعار لـ {symbol} ✅")
-
-        last_prices[symbol] = price
-
-    except Exception as e:
-        print("handle_message Error:", e)
-
-# تشغيل WebSocket
-def start_ws():
-    symbols = r.smembers("binance_pairs")
-    if not symbols:
-        print("❌ لا توجد عملات مسجلة للمراقبة.")
-        send_message("❌ لا توجد عملات مسجلة للمراقبة.")
-        return
-
-    stream_list = [f"{s.decode().lower()}@ticker" for s in symbols]
-    print("✅ الاشتراك في:", stream_list)
-
-    ws = Client()
+    ws = WebSocketClient()
     ws.start()
-    ws.aggregate_subscribe(stream_list, handle_message)
+    ws.kline(symbol=symbol.lower(), interval="1s", callback=handle_message)
 
-# تشغيل السكربت
+def start_monitoring():
+    coins = r.smembers("coins")
+    for coin in coins:
+        coin = coin.decode()
+        threading.Thread(target=monitor_price, args=(coin,), daemon=True).start()
+
+@app.route("/", methods=["POST"])
+def webhook():
+    data = request.json
+    msg = data.get("message", {}).get("text", "")
+    if not msg: return "no text"
+
+    msg = msg.lower()
+    if msg.startswith("سجل"):
+        tokens = msg.split()[1:]
+        added = []
+        for t in tokens:
+            t = t.upper() + "USDT"
+            r.sadd("coins", t)
+            added.append(t)
+        send_message(f"✅ تم تسجيل: {' - '.join(added)}")
+        return "added"
+
+    if msg.startswith("احذف الكل"):
+        deleted = r.smembers("coins")
+        r.delete("coins")
+        names = [d.decode() for d in deleted]
+        send_message(f"🗑️ تم حذف الكل:\n{', '.join(names)}")
+        return "deleted all"
+
+    if msg.startswith("احذف"):
+        coin = msg.split()[1].upper() + "USDT"
+        r.srem("coins", coin)
+        send_message(f"🗑️ تم حذف: {coin}")
+        return "deleted one"
+
+    if msg.startswith("شو سجلت"):
+        coins = r.smembers("coins")
+        if not coins:
+            send_message("📭 لا توجد عملات مسجلة.")
+        else:
+            c = [x.decode() for x in coins]
+            send_message("🔖 العملات المسجلة:\n" + "\n".join(c))
+        return "listed"
+
+    return "ok"
+
 if __name__ == "__main__":
-    send_message("✅ تم تشغيل مراقبة بينانس اللحظية 🚀")
-    start_ws()
+    send_message("✅ البوت اشتغل ويبدأ مراقبة العملات!")
+    threading.Thread(target=start_monitoring, daemon=True).start()
+    app.run(host="0.0.0.0", port=8080)
