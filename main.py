@@ -13,14 +13,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 IS_RUNNING_KEY = "sniper_running"
 
+# إرسال رسالة إلى تيليغرام وتوتو إذا لزم
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": text}
     try:
         requests.post(url, data=data)
+        # إذا كانت إشارة شراء لتوتو → أرسل لتوتو
+        if text.startswith("اشتري") and "توتو" in text:
+            requests.post("https://totozaghnot-production.up.railway.app", json={"message": text})
     except Exception as e:
         print("فشل إرسال الرسالة:", e)
 
+# مراقبة العملة عبر WebSocket
 def watch_price(symbol):
     stream = f"{symbol.lower()}@ticker"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
@@ -54,31 +59,23 @@ def watch_price(symbol):
     ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
 
+# جلب أعلى العملات من Bitvavo
 def fetch_bitvavo_top_symbols():
     try:
         url = "https://api.bitvavo.com/v2/ticker/24h"
         res = requests.get(url)
         data = res.json()
-        eur_coins = [d for d in data if d.get("market", "").endswith("-EUR")]
-
-        for coin in eur_coins:
-            try:
-                open_price = float(coin.get("open", "0"))
-                last_price = float(coin.get("last", "0"))
-                if open_price > 0:
-                    change = ((last_price - open_price) / open_price) * 100
-                    coin["customChange"] = change
-                else:
-                    coin["customChange"] = -999
-            except:
-                coin["customChange"] = -999
-
-        sorted_coins = sorted(eur_coins, key=lambda x: x["customChange"], reverse=True)
+        eur_coins = [
+            d for d in data
+            if d.get("market", "").endswith("-EUR") and "priceChangePercentage" in d
+        ]
+        sorted_coins = sorted(eur_coins, key=lambda x: float(x["priceChangePercentage"]), reverse=True)
         return [coin["market"].replace("-EUR", "") for coin in sorted_coins[:20]]
     except Exception as e:
         print("فشل جلب العملات من Bitvavo:", e)
         return []
 
+# جلب رموز Binance
 def fetch_binance_symbols():
     try:
         res = requests.get("https://api.binance.com/api/v3/exchangeInfo")
@@ -87,6 +84,7 @@ def fetch_binance_symbols():
     except:
         return set()
 
+# تحديث العملات المرصودة كل 10 دقائق (بصمت)
 def update_symbols_loop():
     while True:
         if r.get(IS_RUNNING_KEY) != b"1":
@@ -98,9 +96,9 @@ def update_symbols_loop():
         matched = [c for c in bitvavo if f"{c}USDT" in binance]
         for sym in matched:
             r.sadd("coins", f"{sym}USDT")
-        send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in matched]))
         time.sleep(600)
 
+# تشغيل WebSocket لكل عملة جديدة
 def watcher_loop():
     watched = set()
     while True:
