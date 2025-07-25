@@ -112,19 +112,20 @@ def sniper_loop():
             best_diff = -100
 
             for b_symbol in binance_symbols:
-                coin = b_symbol.replace("USDT", "")
-                if coin not in prices:
-                    continue
-                try:
-                    res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_symbol}")
-                    price_binance = float(res.json()["price"])
-                    price_bitvavo = prices[coin] * eur_usd
-                    diff = (price_binance - price_bitvavo) / price_bitvavo * 100
-                    if 0 < diff < 50 and diff > best_diff:
-                        best_diff = diff
-                        best = b_symbol
-                except:
-                    continue
+    coin = b_symbol.replace("USDT", "")
+    if coin not in prices:
+        continue
+    try:
+        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_symbol}")
+        price_binance = float(res.json()["price"])
+        price_bitvavo = prices[coin] * eur_usd
+        diff = (price_binance - price_bitvavo) / price_bitvavo * 100
+        print(f"🔎 {coin}: Binance={price_binance:.4f}, Bitvavo={price_bitvavo:.4f}, فرق={diff:.2f}%")
+        if 0 < diff < 50 and diff > best_diff:
+            best_diff = diff
+            best = b_symbol
+    except Exception as e:
+        print(f"❌ خطأ في {b_symbol}: {e}")
 
             if best:
                 send_message(f"🎯 أفضل فرق سعري: {best} ({best_diff:.2f}%)")
