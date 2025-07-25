@@ -1,6 +1,6 @@
 import os
-from flask import Flask, request
 import requests
+from flask import Flask, request
 
 app = Flask(__name__)
 
@@ -8,26 +8,33 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 def send_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text
-    }
-    requests.post(url, data=payload)
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        data = {"chat_id": CHAT_ID, "text": text}
+        response = requests.post(url, data=data)
+        print("رسالة تم إرسالها لتلغرام ✅", response.text)
+    except Exception as e:
+        print("خطأ أثناء الإرسال لتلغرام ❌:", str(e))
 
-@app.route('/', methods=["POST"])
+@app.route("/", methods=["POST"])
 def webhook():
-    data = request.json
-    if "message" in data and "text" in data["message"]:
-        text = data["message"]["text"]
-        chat_id = data["message"]["chat"]["id"]
-        reply = f"وصلتني رسالتك: {text}"
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={
-            "chat_id": chat_id,
-            "text": reply
-        })
-    return "ok", 200
+    try:
+        data = request.get_json()
+        print("📩 تم استلام Webhook:", data)
+        return '', 200
+    except Exception as e:
+        print("خطأ أثناء معالجة Webhook:", str(e))
+        return '', 500
 
-@app.route('/')
+@app.route("/", methods=["GET"])
 def home():
-    return "بوتك شغال تمام 🎉", 200
+    return "Bot is alive!", 200
+
+if __name__ == "__main__":
+    try:
+        send_message("✅ البوت اشتغل تمام 🙌")
+        port = int(os.getenv("PORT", 5000))
+        app.run(host="0.0.0.0", port=port)
+    except Exception as e:
+        print("🔥 البوت وقع بخطأ:", str(e))
+        send_message(f"❌ خطأ أثناء تشغيل البوت:\n{str(e)}")
