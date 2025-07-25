@@ -1,62 +1,68 @@
 import os
+import json
+import time
 import redis
 import requests
-from flask import Flask, request
+from binance.websocket.spot.websocket_client import SpotWebsocketClient as Client
 
-app = Flask(__name__)
-r = redis.from_url(os.getenv("REDIS_URL"))
+# إعدادات البيئة
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
+REDIS_URL = os.getenv("REDIS_URL")
+r = redis.from_url(REDIS_URL)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
+# دالة إرسال رسالة تيليغرام
 def send_message(text):
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={
-        "chat_id": CHAT_ID,
-        "text": text
-    })
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        )
+    except Exception as e:
+        print("Telegram Error:", e)
 
-@app.route("/", methods=["POST"])
-def webhook():
-    data = request.json
-    msg = data.get("message", {}).get("text", "").lower()
-    chat_id = str(data.get("message", {}).get("chat", {}).get("id", ""))
-    if chat_id != str(CHAT_ID): return "ok"
+# حفظ الأسعار السابقة
+last_prices = {}
 
-    # تسجيل العملات
-    if msg.startswith("سجل "):
-        parts = msg.replace("سجل ", "").split()
-        added = []
-        for coin in parts:
-            key = f"watch:{coin.upper()}USDT"
-            r.set(key, "1")
-            added.append(coin.upper())
-        send_message(f"✅ تم تسجيل: {' - '.join(added)}")
+# المعالجة عند وصول بيانات
+def handle_message(msg):
+    try:
+        symbol = msg["s"]
+        price = float(msg["c"])
 
-    # حذف الكل
-    elif msg.strip() == "احذف الكل":
-        deleted = []
-        for key in r.scan_iter("watch:*"):
-            r.delete(key)
-            deleted.append(key.decode().split(":")[1])
-        send_message(f"🗑️ تم حذف الكل:\n{', '.join(deleted)}" if deleted else "❌ لا يوجد شيء لحذفه")
+        if symbol not in last_prices:
+            last_prices[symbol] = price
+            return
 
-    # حذف جماعي أو فردي
-    elif msg.startswith("احذف "):
-        parts = msg.replace("احذف ", "").split()
-        deleted = []
-        for coin in parts:
-            key = f"watch:{coin.upper()}USDT"
-            if r.exists(key):
-                r.delete(key)
-                deleted.append(coin.upper())
-        send_message(f"🗑️ تم حذف: {' - '.join(deleted)}" if deleted else "❌ لم يتم العثور على العملات")
+        old_price = last_prices[symbol]
+        change_percent = ((price - old_price) / old_price) * 100
 
-    # عرض محتويات Redis
-    elif msg.strip() == "شو سجلت":
-        coins = [k.decode().split(":")[1] for k in r.scan_iter("watch:*")]
-        send_message("📌 العملات المسجلة:\n" + "\n".join(coins) if coins else "📭 لا توجد عملات مسجلة.")
+        if change_percent >= 2:
+            coin = symbol.replace("USDT", "")
+            send_message(f"🚀 انفجار {coin}: ارتفعت 2% خلال ثانية")
+            print(f"تم إرسال إشعار لـ {symbol} ✅")
 
-    return "ok"
+        last_prices[symbol] = price
 
+    except Exception as e:
+        print("handle_message Error:", e)
+
+# تشغيل WebSocket
+def start_ws():
+    symbols = r.smembers("binance_pairs")
+    if not symbols:
+        print("❌ لا توجد عملات مسجلة للمراقبة.")
+        send_message("❌ لا توجد عملات مسجلة للمراقبة.")
+        return
+
+    stream_list = [f"{s.decode().lower()}@ticker" for s in symbols]
+    print("✅ الاشتراك في:", stream_list)
+
+    ws = Client()
+    ws.start()
+    ws.aggregate_subscribe(stream_list, handle_message)
+
+# تشغيل السكربت
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+    send_message("✅ تم تشغيل مراقبة بينانس اللحظية 🚀")
+    start_ws()
