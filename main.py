@@ -40,7 +40,7 @@ def watch_price(symbol):
         if last_price and last_time:
             price_change = (price - last_price) / last_price * 100
             time_diff = now - last_time
-            if price_change >= 1.5 and time_diff <= 1:
+            if price_change >= 1.8 and time_diff <= 1:
                 coin = symbol.replace("USDT", "")
                 msg = f"اشتري {coin} يا توتو sniper"
                 send_message(msg)
