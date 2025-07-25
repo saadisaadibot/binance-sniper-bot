@@ -12,7 +12,6 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 IS_RUNNING_KEY = "sniper_running"
-TOTO_WEBHOOK = "https://totozaghnot-production.up.railway.app/webhook"  # ✅ إضافة Webhook
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -22,40 +21,46 @@ def send_message(text):
     except Exception as e:
         print("فشل إرسال الرسالة:", e)
 
+def fetch_bitvavo_price(symbol):
+    try:
+        url = f"https://api.bitvavo.com/v2/ticker/price?market={symbol}"
+        res = requests.get(url)
+        return float(res.json()["price"]) if res.status_code == 200 else None
+    except:
+        return None
+
+def get_eur_usd_rate():
+    try:
+        res = requests.get("https://api.exchangerate.host/latest?base=EUR&symbols=USD")
+        return float(res.json()["rates"]["USD"])
+    except:
+        return 1.08
+
 def watch_price(symbol):
     stream = f"{symbol.lower()}@ticker"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
 
-    last_price = None
-    last_time = None
-
     def on_message(ws, message):
-        nonlocal last_price, last_time
         if r.get(IS_RUNNING_KEY) != b"1":
             ws.close()
             return
         data = json.loads(message)
-        price = float(data['c'])
-        now = time.time()
-        if last_price and last_time:
-            price_change = (price - last_price) / last_price * 100
-            time_diff = now - last_time
-            if price_change >= 2 and time_diff <= 1:
-                coin = symbol.replace("USDT", "")
-                msg = f"اشتري {coin} يا توتو sniper"
-                send_message(msg)
-                try:
-                    requests.post(TOTO_WEBHOOK, json={"message": {"text": msg}})
-                except Exception as e:
-                    print("فشل إرسال الإشعار إلى توتو:", e)
-        last_price = price
-        last_time = now
+        price = float(data['c'])  # Binance price in USDT
+        coin = symbol.replace("USDT", "")
+        bitvavo_symbol = f"{coin}-EUR"
+        bitvavo_price = fetch_bitvavo_price(bitvavo_symbol)
+        if not bitvavo_price:
+            return
+        eur_usd = get_eur_usd_rate()
+        bitvavo_usd = bitvavo_price * eur_usd
+        if price >= bitvavo_usd * 1.05:  # ✅ فرق 5%
+            send_message(f"اشتري {coin} يا توتو sniper")
 
     def on_error(ws, error):
         print(f"[{symbol}] خطأ:", error)
 
     def on_close(ws):
-        print(f"[{symbol}] تم الإغلاق - سيتم إعادة المحاولة لاحقًا")
+        print(f"[{symbol}] تم الإغلاق")
 
     ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
@@ -63,37 +68,17 @@ def watch_price(symbol):
 def fetch_bitvavo_top_symbols():
     try:
         url = "https://api.bitvavo.com/v2/ticker/24h"
-        res = requests.get(url)
-        data = res.json()
-        eur_coins = [
-            d for d in data 
-            if d.get("market", "").endswith("-EUR") 
-            and len(d.get("market", "")) > 5
-        ]
-
-        for coin in eur_coins:
-            try:
-                open_price = float(coin.get("open", "0"))
-                last_price = float(coin.get("last", "0"))
-                if open_price > 0:
-                    change = ((last_price - open_price) / open_price) * 100
-                    coin["customChange"] = change
-                else:
-                    coin["customChange"] = -999
-            except:
-                coin["customChange"] = -999
-
-        sorted_coins = sorted(eur_coins, key=lambda x: x["customChange"], reverse=True)
-        return [coin["market"].replace("-EUR", "").upper() for coin in sorted_coins[:50]]
-    except Exception as e:
-        print("فشل جلب العملات من Bitvavo:", e)
+        data = requests.get(url).json()
+        eur_coins = [d for d in data if d.get("market", "").endswith("-EUR")]
+        sorted_coins = sorted(eur_coins, key=lambda x: float(x.get("priceChangePercentage", 0)), reverse=True)
+        return [coin["market"].replace("-EUR", "") for coin in sorted_coins[:20]]
+    except:
         return []
 
 def fetch_binance_symbols():
     try:
         res = requests.get("https://api.binance.com/api/v3/exchangeInfo")
-        data = res.json()
-        return set(s['symbol'] for s in data['symbols'])
+        return set(s['symbol'] for s in res.json()['symbols'])
     except:
         return set()
 
@@ -102,34 +87,12 @@ def update_symbols_loop():
         if r.get(IS_RUNNING_KEY) != b"1":
             time.sleep(5)
             continue
-
         r.delete("coins")
         bitvavo = fetch_bitvavo_top_symbols()
-        if not bitvavo:
-            print("⚠️ لم يتم جلب رموز من Bitvavo.")
-            time.sleep(600)
-            continue
-
         binance = fetch_binance_symbols()
-        if not binance:
-            print("⚠️ لم يتم جلب رموز من Binance.")
-            time.sleep(600)
-            continue
-
-        matched = []
-        for c in bitvavo:
-            symbol = f"{c}USDT"
-            if symbol in binance:
-                matched.append(c)
-
-        if matched:
-            for sym in matched:
-                r.sadd("coins", f"{sym}USDT")
-            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in matched]))
-        else:
-            print("⚠️ لم يتم العثور على رموز متطابقة.")
-            send_message("🚫 لا توجد عملات قابلة للمراقبة حالياً.")
-
+        matched = [c for c in bitvavo if f"{c}USDT" in binance]
+        for sym in matched:
+            r.sadd("coins", f"{sym}USDT")
         time.sleep(600)
 
 def watcher_loop():
@@ -148,7 +111,7 @@ def watcher_loop():
 
 @app.route("/")
 def home():
-    return "🔥 Sniper Mode is Live", 200
+    return "🔥 Arbitrage Sniper Mode is Live", 200
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -158,21 +121,14 @@ def telegram_webhook():
     text = data["message"].get("text", "").strip().lower()
     if text == "play":
         r.set(IS_RUNNING_KEY, "1")
-        send_message("✅ بدأ التشغيل Sniper.")
-        coins = r.smembers("coins")
-        coin_list = [c.decode().replace("USDT", "") for c in coins]
-        if coin_list:
-            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in coin_list]))
+        send_message("✅ Sniper بدأ التشغيل.")
     elif text == "stop":
         r.set(IS_RUNNING_KEY, "0")
-        send_message("🛑 تم إيقاف Sniper مؤقتًا.")
+        send_message("🛑 Sniper تم إيقافه مؤقتًا.")
     elif text == "السجل":
         coins = r.smembers("coins")
         coin_list = [c.decode().replace("USDT", "") for c in coins]
-        if coin_list:
-            send_message("📡 العملات المرصودة:\n" + "\n".join(coin_list))
-        else:
-            send_message("🚫 لا توجد عملات قيد المراقبة حالياً.")
+        send_message("📡 العملات المرصودة:\n" + "\n".join(coin_list)) if coin_list else send_message("🚫 لا توجد عملات.")
     return jsonify(ok=True)
 
 if __name__ == "__main__":
