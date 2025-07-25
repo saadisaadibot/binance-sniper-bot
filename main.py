@@ -1,4 +1,4 @@
-=import os
+import os
 import json
 import time
 import redis
@@ -82,7 +82,7 @@ def watch_best(symbol):
                 return
             price_bitvavo_usd = price_bitvavo * eur_usd
             diff = (price_binance - price_bitvavo_usd) / price_bitvavo_usd * 100
-            if 0 < diff < 50 and diff >= 1:
+            if 0 < diff < 50 and diff >= 0.7:
                 print(f"🚀 فرق {diff:.2f}% - {coin}")
                 send_toto(coin)
                 ws.close()
@@ -96,7 +96,7 @@ def watch_best(symbol):
     ws = WebSocketApp(url, on_message=on_message, on_close=on_close)
     thread = threading.Thread(target=ws.run_forever)
     thread.start()
-    time.sleep(120)  # دقيقتين
+    time.sleep(120)
     ws.close()
 
 # ========== بدء دورة المراقبة ==========
@@ -111,21 +111,23 @@ def sniper_loop():
             best = None
             best_diff = -100
 
+            print("✅ عدد عملات Bitvavo المتاحة:", len(prices))
+
             for b_symbol in binance_symbols:
-    coin = b_symbol.replace("USDT", "")
-    if coin not in prices:
-        continue
-    try:
-        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_symbol}")
-        price_binance = float(res.json()["price"])
-        price_bitvavo = prices[coin] * eur_usd
-        diff = (price_binance - price_bitvavo) / price_bitvavo * 100
-        print(f"🔎 {coin}: Binance={price_binance:.4f}, Bitvavo={price_bitvavo:.4f}, فرق={diff:.2f}%")
-        if 0 < diff < 50 and diff > best_diff:
-            best_diff = diff
-            best = b_symbol
-    except Exception as e:
-        print(f"❌ خطأ في {b_symbol}: {e}")
+                coin = b_symbol.replace("USDT", "")
+                if coin not in prices:
+                    continue
+                try:
+                    res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_symbol}")
+                    price_binance = float(res.json()["price"])
+                    price_bitvavo = prices[coin] * eur_usd
+                    diff = (price_binance - price_bitvavo) / price_bitvavo * 100
+                    print(f"🔎 {coin}: Binance={price_binance:.4f}, Bitvavo={price_bitvavo:.4f}, فرق={diff:.2f}%")
+                    if 0 < diff < 50 and diff > best_diff:
+                        best_diff = diff
+                        best = b_symbol
+                except Exception as e:
+                    print(f"❌ خطأ في {b_symbol}: {e}")
 
             if best:
                 send_message(f"🎯 أفضل فرق سعري: {best} ({best_diff:.2f}%)")
@@ -136,7 +138,7 @@ def sniper_loop():
         except Exception as e:
             print("خطأ في sniper_loop:", e)
 
-        time.sleep(600)  # كل 10 دقائق
+        time.sleep(600)
 
 # ========== تشغيل التطبيق ==========
 if __name__ == "__main__":
