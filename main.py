@@ -1,41 +1,38 @@
 import os
 import redis
-from flask import Flask, request
 import requests
+from flask import Flask, request
 
 app = Flask(__name__)
-
-# تحميل المتغيرات من بيئة Railway
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 REDIS_URL = os.getenv("REDIS_URL")
-
 r = redis.from_url(REDIS_URL)
 
-# إرسال رسالة إلى تيليغرام
-def send_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": text}
-    requests.post(url, data=data)
-
-# استقبال رسائل من تيليغرام عبر الويب هوك
 @app.route("/", methods=["POST"])
-def webhook():
-    data = request.json
-    print("📨 وصلت رسالة:", data)
+def telegram_webhook():
+    data = request.get_json()
+    if not data or "message" not in data:
+        return "ignored"
 
-    try:
-        message = data["message"]["text"]
-        chat_id = data["message"]["chat"]["id"]
+    message = data["message"]
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
 
-        if message.startswith("سجل "):
-            coin = message.split("سجل ")[1].strip()
-            r.sadd("test_saved_coins", coin)
-            send_message(f"✅ تم تسجيل: {coin}")
+    if text.startswith("سجل "):
+        content = text.replace("سجل", "").strip()
+        if content:
+            r.sadd("test_saves", content.upper())
+            send_message(f"تم حفظ {content.upper()} ✅", chat_id)
         else:
-            send_message("🤖 أرسل أمر بصيغة: سجل ADA")
+            send_message("⚠️ لم يتم تحديد محتوى", chat_id)
 
-    except Exception as e:
-        print("خطأ في المعالجة:", e)
+    return "ok"
 
-    return "OK", 200
+def send_message(text, chat_id):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    requests.post(url, data=payload)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
