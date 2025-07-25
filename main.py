@@ -3,25 +3,27 @@ import json
 import time
 import redis
 import threading
-from flask import Flask, request
+import requests
+from flask import Flask, request, jsonify
 from websocket import WebSocketApp
 
-# إعداد المتغيرات
 app = Flask(__name__)
-r = redis.from_url(os.getenv("REDIS_URL"))
-chat_id = os.getenv("CHAT_ID")
-bot_token = os.getenv("BOT_TOKEN")
 
-# دالة إرسال رسالة تيليغرام
+# إعداد المتغيرات من env
+r = redis.from_url(os.getenv("REDIS_URL"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+# إرسال رسالة إلى تيليغرام
 def send_message(text):
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    data = {"chat_id": chat_id, "text": text}
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text}
     try:
         requests.post(url, data=data)
-    except:
-        pass
+    except Exception as e:
+        print("فشل إرسال الرسالة:", e)
 
-# دالة WebSocket لمراقبة الأسعار
+# مراقبة السعر عبر WebSocket
 def watch_price(symbol):
     stream = f"{symbol.lower()}@ticker"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
@@ -30,10 +32,10 @@ def watch_price(symbol):
         data = json.loads(message)
         price = float(data['c'])
         print(f"[{symbol}] السعر الحالي: {price}")
-        # يمكن إضافة منطق الإشعار هنا إذا السعر ارتفع بسرعة
+        # هنا يمكن إضافة شرط القفزة والإشعار
 
     def on_error(ws, error):
-        print(f"[{symbol}] خطأ: {error}")
+        print(f"[{symbol}] خطأ:", error)
 
     def on_close(ws):
         print(f"[{symbol}] تم الإغلاق")
@@ -41,43 +43,67 @@ def watch_price(symbol):
     ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
 
-# دالة لفحص العملات المسجلة وتشغيل WebSocket عليها
+# تشغيل مراقبة العملات من Redis
 def watcher_loop():
     watched = set()
     while True:
         coins = r.smembers("coins")
-        symbols = {coin.decode('utf-8') for coin in coins}
+        symbols = {coin.decode() for coin in coins}
         new_symbols = symbols - watched
         for symbol in new_symbols:
             threading.Thread(target=watch_price, args=(symbol,)).start()
             watched.add(symbol)
         time.sleep(5)
 
-# نقطة بداية البوت
+# الصفحة الرئيسية
 @app.route('/')
 def home():
-    return "Bot Running"
+    return "✅ البوت شغّال تمام"
 
+# الراوت الخاص بالويبهوك
 @app.route('/webhook', methods=['POST'])
-def webhook():
+def telegram_webhook():
     data = request.get_json()
-    message = data.get("message", {}).get("text", "").lower()
-    if message.startswith("سجل"):
-        tokens = message.split()[1:]
+
+    if not data or "message" not in data:
+        return jsonify(success=True)
+
+    message = data["message"]
+    text = message.get("text", "").strip().lower()
+    user_id = message["chat"]["id"]
+
+    if text.startswith("سجل"):
+        tokens = text.split()[1:]
         added = []
         for token in tokens:
             full = f"{token.upper()}USDT"
             r.sadd("coins", full)
             added.append(full)
-        return f"✅ تم تسجيل: {' - '.join(added)}", 200
-    elif message == "احذف الكل":
+        reply = f"✅ تم تسجيل: {' - '.join(added)}"
+        send_message(reply)
+        return jsonify(ok=True)
+
+    elif text == "احذف الكل":
         deleted = r.smembers("coins")
         r.delete("coins")
         names = [x.decode() for x in deleted]
-        return f"🗑️ تم حذف الكل: {', '.join(names)}", 200
-    return "تم", 200
+        reply = f"🗑️ تم حذف الكل: {', '.join(names)}"
+        send_message(reply)
+        return jsonify(ok=True)
 
-# بدء الخيوط
+    elif text == "شو سجلت":
+        saved = r.smembers("coins")
+        if saved:
+            names = [x.decode() for x in saved]
+            reply = f"📌 العملات المسجلة:\n" + "\n".join(names)
+        else:
+            reply = "📡 لا توجد عملات مسجلة."
+        send_message(reply)
+        return jsonify(ok=True)
+
+    return jsonify(success=True)
+
+# تشغيل البوت
 if __name__ == '__main__':
     threading.Thread(target=watcher_loop).start()
     app.run(host="0.0.0.0", port=8080)
