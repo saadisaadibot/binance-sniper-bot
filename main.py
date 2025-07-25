@@ -99,17 +99,31 @@ def watch_best(symbol):
             if diff >= 3:
                 send_toto(coin)
                 ws.close()
-        except:
-            pass
+        except Exception as e:
+            print(f"❌ خطأ في on_message: {e}")
 
-    def on_close(ws): print("📴 المراقبة انتهت.")
-    def on_error(ws, err): print("❌ WebSocket Error:", err)
+    def on_close(ws, close_status_code, close_msg):
+        print(f"🛑 WebSocket Closed for {symbol} (code={close_status_code}, msg={close_msg})")
 
-    url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
-    ws = WebSocketApp(url, on_message=on_message, on_close=on_close, on_error=on_error)
+    def on_error(ws, error):
+        print(f"❌ WebSocket Error: {error}")
 
-    def run():
-        ws.run_forever()
+    def on_open(ws):
+        ws.send(json.dumps({
+            "method": "SUBSCRIBE",
+            "params": [f"{symbol.lower()}@ticker"],
+            "id": 1
+        }))
+
+    ws = websocket.WebSocketApp(
+        f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker",
+        on_open=on_open,
+        on_message=on_message,
+        on_close=on_close,
+        on_error=on_error
+    )
+
+    ws.run_forever()
 
     thread = threading.Thread(target=run)
     thread.daemon = True
