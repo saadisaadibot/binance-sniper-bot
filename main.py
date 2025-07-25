@@ -2,37 +2,31 @@ import os
 import time
 import json
 import redis
-import requests
 import threading
-from flask import Flask, request, jsonify
+import requests
+from flask import Flask, request
+from websocket import WebSocketApp
 
 app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
 WEBHOOK_URL = "https://totozaghnot-production.up.railway.app"
-
 IS_RUNNING_KEY = "sniper_running"
-TARGET_SYMBOL_KEY = "sniper_top_symbol"
-NOTIFIED_KEY = "sniper_notified"
 
-def send_message(text):
+def send_buy_signal(coin):
+    payload = {"message": f"اشتري {coin} يا توتو sniper"}
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": text})
-    except:
-        pass
-
-def send_to_toto(coin):
-    try:
-        requests.post(WEBHOOK_URL, json={"text": f"اشتري {coin} يا توتو sniper"})
-    except:
-        pass
+        requests.post(WEBHOOK_URL, json=payload)
+    except Exception as e:
+        print(f"فشل إرسال الإشعار لتوتو: {e}")
 
 def fetch_bitvavo_price(symbol):
     try:
         url = f"https://api.bitvavo.com/v2/ticker/price?market={symbol}"
         res = requests.get(url)
-        return float(res.json()["price"]) if res.status_code == 200 else None
+        price = float(res.json()["price"])
+        if price < 0.01: return None  # تجاهل الأسعار الصغيرة جداً
+        return price
     except:
         return None
 
@@ -47,110 +41,117 @@ def fetch_binance_price(symbol):
     try:
         url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
         res = requests.get(url)
-        return float(res.json()["price"]) if res.status_code == 200 else None
+        return float(res.json()["price"])
     except:
         return None
 
-def fetch_binance_symbols():
-    try:
-        res = requests.get("https://api.binance.com/api/v3/exchangeInfo")
-        return set(s['symbol'] for s in res.json()['symbols'])
-    except:
-        return set()
-
-def fetch_bitvavo_top_symbols():
-    try:
-        res = requests.get("https://api.bitvavo.com/v2/ticker/24h")
-        data = res.json()
-        eur = [x for x in data if x.get("market", "").endswith("-EUR")]
-        sorted_data = sorted(eur, key=lambda x: float(x.get("priceChangePercentage", 0)), reverse=True)
-        return [x["market"].replace("-EUR", "") for x in sorted_data[:50]]
-    except:
-        return []
-
-def get_price_diff(coin, eur_usd):
-    binance_price = fetch_binance_price(f"{coin}USDT")
-    bitvavo_price = fetch_bitvavo_price(f"{coin}-EUR")
-    if not binance_price or not bitvavo_price:
-        return None, None, None
-    bitvavo_usd = bitvavo_price * eur_usd
-    diff = ((binance_price - bitvavo_usd) / bitvavo_usd) * 100
-    return binance_price, bitvavo_usd, diff
-
-def monitor_top_symbol(symbol):
+def monitor_top_coin(top_coin):
+    coin = top_coin.replace("USDT", "")
+    symbol_bv = f"{coin}-EUR"
     eur_usd = get_eur_usd_rate()
-    r.set(NOTIFIED_KEY, "0")
-    start = time.time()
 
-    while time.time() - start < 120:  # دقيقتين
-        if r.get(IS_RUNNING_KEY) != b"1":
-            return
-        binance, bitvavo, diff = get_price_diff(symbol, eur_usd)
-        if not diff: continue
-        print(f"[{symbol}] Diff: {diff:.2f}%")
+    print(f"🎯 ببدأ التركيز على: {coin}")
+    best_diff = 0
 
-        if diff >= 3 and r.get(NOTIFIED_KEY) != b"1":
-            send_to_toto(symbol)
-            r.set(NOTIFIED_KEY, "1")
-        time.sleep(1)
-
-    if r.get(NOTIFIED_KEY) != b"1":
-        send_message("🐇 هرب الأرنب")
-    r.set(TARGET_SYMBOL_KEY, "")  # لنبدأ من جديد
-
-def sniper_loop():
-    while True:
-        if r.get(IS_RUNNING_KEY) != b"1":
-            time.sleep(3)
-            continue
-
-        if r.get(TARGET_SYMBOL_KEY):
+    for _ in range(120):  # دقيقتين مراقبة
+        if r.get(IS_RUNNING_KEY) != b"1": return
+        binance_price = fetch_binance_price(top_coin)
+        bitvavo_price = fetch_bitvavo_price(symbol_bv)
+        if not binance_price or not bitvavo_price:
             time.sleep(1)
             continue
 
-        r.delete("sniper_cache")
-        eur_usd = get_eur_usd_rate()
-        top50 = fetch_bitvavo_top_symbols()
-        available = fetch_binance_symbols()
+        bitvavo_usd = bitvavo_price * eur_usd
+        diff = ((binance_price - bitvavo_usd) / bitvavo_usd) * 100
 
-        candidates = []
-        for coin in top50:
-            if f"{coin}USDT" not in available:
-                continue
-            b_price, v_price, diff = get_price_diff(coin, eur_usd)
-            if diff is not None:
-                candidates.append((coin, diff))
-
-        if not candidates:
-            time.sleep(10)
+        if diff > 50 or diff < 0:  # تجاهل الفروقات الوهمية
+            time.sleep(1)
             continue
 
-        best = max(candidates, key=lambda x: x[1])
-        r.set(TARGET_SYMBOL_KEY, best[0])
-        print(f"🎯 أفضل عملة: {best[0]} بفارق {best[1]:.2f}%")
-        threading.Thread(target=monitor_top_symbol, args=(best[0],), daemon=True).start()
-        time.sleep(30)
+        print(f"[{coin}] Diff: {diff:.2f}%")
+        if diff > 3.5:
+            send_buy_signal(coin)
+            return
+        time.sleep(1)
+
+    print("🐇 هرب الأرنب!")
+    time.sleep(1)
+
+def scan_top_50_loop():
+    while True:
+        if r.get(IS_RUNNING_KEY) != b"1":
+            time.sleep(5)
+            continue
+
+        try:
+            r.delete("coins")
+            res = requests.get("https://api.binance.com/api/v3/ticker/24hr")
+            coins = sorted(res.json(), key=lambda x: float(x["priceChangePercent"]), reverse=True)
+            top50 = [c["symbol"] for c in coins if c["symbol"].endswith("USDT") and not c["symbol"].endswith("BUSD")][:50]
+            for coin in top50:
+                r.sadd("coins", coin)
+
+            print("🚀 جارٍ فحص أفضل 50 عملة...")
+
+            # تحليل الفروقات السريعة
+            best = None
+            best_diff = 0
+            eur_usd = get_eur_usd_rate()
+            for coin in top50:
+                coin_name = coin.replace("USDT", "")
+                bv_symbol = f"{coin_name}-EUR"
+
+                binance_price = fetch_binance_price(coin)
+                bitvavo_price = fetch_bitvavo_price(bv_symbol)
+                if not binance_price or not bitvavo_price:
+                    continue
+
+                bitvavo_usd = bitvavo_price * eur_usd
+                diff = ((binance_price - bitvavo_usd) / bitvavo_usd) * 100
+
+                if diff > 50 or diff < 0: continue  # فلترة القيم الوهمية
+
+                if diff > best_diff:
+                    best_diff = diff
+                    best = coin
+
+                print(f"[{coin_name}] Diff: {diff:.2f}%")
+
+            if best:
+                print(f"🎯 أفضل عملة: {best.replace('USDT','')} {best_diff:.2f}%")
+                monitor_top_coin(best)
+        except Exception as e:
+            print("حدث خطأ في حلقة المراقبة:", e)
 
 @app.route("/")
 def home():
-    return "🚀 Sniper Precision Mode Active", 200
+    return "Sniper Smart Mode™ جاهز", 200
 
 @app.route("/webhook", methods=["POST"])
-def telegram():
+def telegram_webhook():
     data = request.get_json()
-    text = data.get("message", {}).get("text", "").strip().lower()
+    text = data.get("message", {}).get("text", "").lower()
     if text == "play":
         r.set(IS_RUNNING_KEY, "1")
-        r.set(TARGET_SYMBOL_KEY, "")
-        send_message("✅ Sniper بدأ التشغيل.")
+        send_message("✅ بدأ سنايبر الذكي.")
     elif text == "stop":
         r.set(IS_RUNNING_KEY, "0")
-        send_message("🛑 Sniper تم إيقافه.")
-    return jsonify(ok=True)
+        send_message("🛑 تم إيقاف سنايبر.")
+    elif text == "السجل":
+        coins = r.smembers("coins")
+        text = "📡 العملات المرصودة:\n" + "\n".join(c.decode().replace("USDT", "") for c in coins)
+        send_message(text)
+    return {"ok": True}
+
+def send_message(text):
+    try:
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                      data={"chat_id": os.getenv("CHAT_ID"), "text": text})
+    except:
+        pass
 
 if __name__ == "__main__":
     r.set(IS_RUNNING_KEY, "1")
-    r.set(TARGET_SYMBOL_KEY, "")
-    r.delete("sniper_cache")
-    threading.Thread(target=sniper_loop, daemon=True).start()
+    r.delete("coins")
+    threading.Thread(target=scan_top_50_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
