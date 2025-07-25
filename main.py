@@ -33,6 +33,10 @@ def send_message(text, chat_id):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     requests.post(url, data=payload)
-
+@app.route("/", methods=["POST"])
+def telegram_webhook():
+    print("🔥 Received Telegram Webhook")
+    data = request.get_json()
+    print(data)
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
