@@ -12,6 +12,7 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 IS_RUNNING_KEY = "sniper_running"
+TOTO_WEBHOOK = "https://totozaghnot-production.up.railway.app/webhook"  # ✅ إضافة Webhook
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -41,7 +42,12 @@ def watch_price(symbol):
             time_diff = now - last_time
             if price_change >= 2 and time_diff <= 1:
                 coin = symbol.replace("USDT", "")
-                send_message(f"اشتري {coin} يا توتو sniper")
+                msg = f"اشتري {coin} يا توتو sniper"
+                send_message(msg)
+                try:
+                    requests.post(TOTO_WEBHOOK, json={"message": {"text": msg}})
+                except Exception as e:
+                    print("فشل إرسال الإشعار إلى توتو:", e)
         last_price = price
         last_time = now
 
@@ -62,7 +68,7 @@ def fetch_bitvavo_top_symbols():
         eur_coins = [
             d for d in data 
             if d.get("market", "").endswith("-EUR") 
-            and len(d.get("market", "")) > 5  # استبعاد الرموز القصيرة أو الغريبة مثل A-EUR
+            and len(d.get("market", "")) > 5
         ]
 
         for coin in eur_coins:
@@ -153,7 +159,6 @@ def telegram_webhook():
     if text == "play":
         r.set(IS_RUNNING_KEY, "1")
         send_message("✅ بدأ التشغيل Sniper.")
-        # عرض العملات الحالية بعد التشغيل
         coins = r.smembers("coins")
         coin_list = [c.decode().replace("USDT", "") for c in coins]
         if coin_list:
