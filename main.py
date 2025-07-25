@@ -1,89 +1,75 @@
-import websocket
 import os
 import json
 import time
 import redis
-import requests
 import threading
-from flask import Flask, request, jsonify
+import requests
+from flask import Flask, request
+from websocket import WebSocketApp
 
 app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 IS_RUNNING_KEY = "sniper_running"
-TOUTO_WEBHOOK = "https://totozaghnot-production.up.railway.app"
+TOTO_WEBHOOK = "https://totozaghnot-production.up.railway.app/webhook"
 
+# ========== إرسال إشعار إلى توتو ==========
 def send_toto(coin):
     try:
-        requests.post(TOUTO_WEBHOOK, json={"message": f"اشتري {coin} يا توتو sniper"})
-    except:
-        pass
+        requests.post(TOTO_WEBHOOK, json={"message": f"اشتري {coin} يا توتو sniper"})
+    except Exception as e:
+        print("فشل إرسال إلى توتو:", e)
 
+# ========== إرسال رسالة تيليغرام ==========
 def send_message(text):
-    chat_id = os.getenv("CHAT_ID")
-    token = os.getenv("BOT_TOKEN")
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": text})
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        data = {"chat_id": CHAT_ID, "text": text}
+        requests.post(url, data=data)
+    except Exception as e:
+        print("فشل إرسال رسالة:", e)
 
+# ========== جلب سعر اليورو مقابل الدولار ==========
 def get_usd_rate():
     try:
         res = requests.get("https://api.exchangerate.host/latest?base=EUR&symbols=USD")
-        return float(res.json()["rates"]["USD"])
+        return res.json()["rates"]["USD"]
     except:
-        return 1.08
+        return 1.1  # افتراضي
 
-def fetch_bitvavo_prices():
+# ========== جلب أعلى 50 عملة من Bitvavo ==========
+def get_top_50_symbols():
     try:
-        url = "https://api.bitvavo.com/v2/ticker/price"
-        data = requests.get(url).json()
-        return {item['market'].replace("-EUR", ""): float(item['price']) for item in data if item['market'].endswith("-EUR")}
-    except:
-        return {}
-
-def fetch_binance_symbols():
-    try:
-        res = requests.get("https://api.binance.com/api/v3/exchangeInfo")
-        return set(s['symbol'] for s in res.json()['symbols'])
-    except:
-        return set()
-
-def fetch_binance_top():
-    try:
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        res = requests.get(url).json()
-        sorted_data = sorted(res, key=lambda x: float(x['priceChangePercent']), reverse=True)
-        return [d['symbol'] for d in sorted_data if d['symbol'].endswith("USDT")][:50]
+        res = requests.get("https://api.bitvavo.com/v2/ticker/price")
+        prices = res.json()
+        changes = {}
+        for item in prices:
+            symbol = item["market"]
+            if not symbol.endswith("-EUR"):
+                continue
+            try:
+                ticker = requests.get(f"https://api.bitvavo.com/v2/{symbol}/ticker/24h").json()
+                change = float(ticker.get("priceChangePercentage", 0))
+                changes[symbol] = change
+            except:
+                continue
+        top = sorted(changes.items(), key=lambda x: x[1], reverse=True)
+        return [s[0] for s in top[:50]]
     except:
         return []
 
-def find_best_arbitrage():
-    eur_usd = get_usd_rate()
-    bitvavo = fetch_bitvavo_prices()
-    top = fetch_binance_top()
-    binance_symbols = fetch_binance_symbols()
+# ========== جلب أسعار Bitvavo ==========
+def fetch_bitvavo_prices():
+    try:
+        res = requests.get("https://api.bitvavo.com/v2/ticker/price").json()
+        return {i["market"].replace("-EUR", ""): float(i["price"]) for i in res if i["market"].endswith("-EUR")}
+    except:
+        return {}
 
-    best = None
-    best_diff = 0
-
-    for symbol in top:
-        coin = symbol.replace("USDT", "")
-        if symbol not in binance_symbols or coin not in bitvavo:
-            continue
-        try:
-            url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-            res = requests.get(url).json()
-            price_binance = float(res['price'])
-            price_bitvavo_usd = bitvavo[coin] * eur_usd
-            diff = (price_binance - price_bitvavo_usd) / price_bitvavo_usd * 100
-            if 0 < diff > best_diff:
-                best = symbol
-                best_diff = diff
-        except:
-            continue
-    return best
-
+# ========== مراقبة فرق السعر عبر WebSocket ==========
 def watch_best(symbol):
     coin = symbol.replace("USDT", "")
-    bitvavo_symbol = f"{coin}-EUR"
     eur_usd = get_usd_rate()
     print(f"🎯 متابعة {symbol} لمدة دقيقتين...")
 
@@ -92,76 +78,62 @@ def watch_best(symbol):
             data = json.loads(message)
             price_binance = float(data['c'])
             price_bitvavo = fetch_bitvavo_prices().get(coin)
-            if not price_bitvavo:
+            if not price_bitvavo or price_bitvavo < 0.01:
                 return
             price_bitvavo_usd = price_bitvavo * eur_usd
             diff = (price_binance - price_bitvavo_usd) / price_bitvavo_usd * 100
-            if diff >= 3:
+            if 0 < diff < 50 and diff >= 3:
+                print(f"🚀 فرق {diff:.2f}% - {coin}")
                 send_toto(coin)
                 ws.close()
         except Exception as e:
-            print(f"❌ خطأ في on_message: {e}")
+            print("❌ خطأ في on_message:", e)
 
-    def on_close(ws, close_status_code, close_msg):
-        print(f"🛑 WebSocket Closed for {symbol} (code={close_status_code}, msg={close_msg})")
+    def on_close(ws, code, msg):
+        print(f"🔴 WebSocket Closed for {symbol} (code={code}, msg={msg})")
 
-    def on_error(ws, error):
-        print(f"❌ WebSocket Error: {error}")
-
-    def on_open(ws):
-        ws.send(json.dumps({
-            "method": "SUBSCRIBE",
-            "params": [f"{symbol.lower()}@ticker"],
-            "id": 1
-        }))
-
-    ws = websocket.WebSocketApp(
-        f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker",
-        on_open=on_open,
-        on_message=on_message,
-        on_close=on_close,
-        on_error=on_error
-    )
-
-    ws.run_forever()
-
-    thread = threading.Thread(target=run)
-    thread.daemon = True
+    url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
+    ws = WebSocketApp(url, on_message=on_message, on_close=on_close)
+    thread = threading.Thread(target=ws.run_forever)
     thread.start()
-    time.sleep(120)
-    if thread.is_alive():
-        send_message("🐰 هرب الأرنب")
-        try: ws.close()
-        except: pass
+    time.sleep(120)  # دقيقتين
+    ws.close()
 
+# ========== بدء دورة المراقبة ==========
 def sniper_loop():
     while True:
-        if r.get(IS_RUNNING_KEY) != b"1":
-            time.sleep(5)
-            continue
-        best = find_best_arbitrage()
-        if best:
-            watch_best(best)
-        time.sleep(1)
+        try:
+            r.set(IS_RUNNING_KEY, "1")
+            top_symbols = get_top_50_symbols()
+            binance_symbols = [s.replace("-EUR", "USDT") for s in top_symbols if s.replace("-EUR", "USDT").isupper()]
+            prices = fetch_bitvavo_prices()
+            eur_usd = get_usd_rate()
+            best = None
+            best_diff = -100
 
-@app.route("/")
-def home():
-    return "🚀 Sniper PRO V3 Live", 200
+            for b_symbol in binance_symbols:
+                coin = b_symbol.replace("USDT", "")
+                if coin not in prices:
+                    continue
+                try:
+                    res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_symbol}")
+                    price_binance = float(res.json()["price"])
+                    price_bitvavo = prices[coin] * eur_usd
+                    diff = (price_binance - price_bitvavo) / price_bitvavo * 100
+                    if 0 < diff < 50 and diff > best_diff:
+                        best_diff = diff
+                        best = b_symbol
+                except:
+                    continue
 
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json()
-    text = data.get("message", {}).get("text", "").lower()
-    if "play" in text:
-        r.set(IS_RUNNING_KEY, "1")
-        send_message("✅ بدأ Sniper PRO.")
-    elif "stop" in text:
-        r.set(IS_RUNNING_KEY, "0")
-        send_message("🛑 تم إيقاف Sniper PRO.")
-    return jsonify(ok=True)
+            if best:
+                send_message(f"🎯 أفضل فرق سعري: {best} ({best_diff:.2f}%)")
+                watch_best(best)
+                send_message("🐰 هرب الأرنب..")
+            else:
+                send_message("❌ لم يتم العثور على عملة مناسبة.")
 
-if __name__ == "__main__":
-    r.flushall()
-    r.set(IS_RUNNING_KEY, "1")
-    threading.Thread(target=sniper_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=8080)
+        except Exception as e:
+            print("خطأ في sniper_loop:", e)
+
+        time.sleep(600)  # كل 10 دقائق
