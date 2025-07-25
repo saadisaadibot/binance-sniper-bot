@@ -1,4 +1,4 @@
-import os
+=import os
 import json
 import time
 import redis
@@ -82,7 +82,7 @@ def watch_best(symbol):
                 return
             price_bitvavo_usd = price_bitvavo * eur_usd
             diff = (price_binance - price_bitvavo_usd) / price_bitvavo_usd * 100
-            if 0 < diff < 50 and diff >= 2:
+            if 0 < diff < 50 and diff >= 1:
                 print(f"🚀 فرق {diff:.2f}% - {coin}")
                 send_toto(coin)
                 ws.close()
