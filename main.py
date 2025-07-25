@@ -1,90 +1,83 @@
 import os
-import redis
-import requests
-import time
 import json
+import time
+import redis
 import threading
 from flask import Flask, request
-from binance.websocket.spot.websocket_client import SpotWebsocketClient as WebSocketClient
+from websocket import WebSocketApp
 
+# إعداد المتغيرات
 app = Flask(__name__)
+r = redis.from_url(os.getenv("REDIS_URL"))
+chat_id = os.getenv("CHAT_ID")
+bot_token = os.getenv("BOT_TOKEN")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-REDIS_URL = os.getenv("REDIS_URL")
-r = redis.from_url(REDIS_URL)
-
-tracked_prices = {}
-
+# دالة إرسال رسالة تيليغرام
 def send_message(text):
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": text})
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    data = {"chat_id": chat_id, "text": text}
+    try:
+        requests.post(url, data=data)
+    except:
+        pass
 
-def monitor_price(symbol):
-    def handle_message(msg):
-        symbol = msg['s']
-        price = float(msg['c'])
-        now = time.time()
+# دالة WebSocket لمراقبة الأسعار
+def watch_price(symbol):
+    stream = f"{symbol.lower()}@ticker"
+    url = f"wss://stream.binance.com:9443/ws/{stream}"
 
-        if symbol in tracked_prices:
-            prev_price, prev_time = tracked_prices[symbol]
-            if now - prev_time <= 1:
-                change = (price - prev_price) / prev_price * 100
-                if change >= 2:
-                    send_message(f"🚀 ارتفاع مفاجئ: {symbol} صعدت {change:.2f}% خلال ثانية!")
-        tracked_prices[symbol] = (price, now)
+    def on_message(ws, message):
+        data = json.loads(message)
+        price = float(data['c'])
+        print(f"[{symbol}] السعر الحالي: {price}")
+        # يمكن إضافة منطق الإشعار هنا إذا السعر ارتفع بسرعة
 
-    ws = WebSocketClient()
-    ws.start()
-    ws.kline(symbol=symbol.lower(), interval="1s", callback=handle_message)
+    def on_error(ws, error):
+        print(f"[{symbol}] خطأ: {error}")
 
-def start_monitoring():
-    coins = r.smembers("coins")
-    for coin in coins:
-        coin = coin.decode()
-        threading.Thread(target=monitor_price, args=(coin,), daemon=True).start()
+    def on_close(ws):
+        print(f"[{symbol}] تم الإغلاق")
 
-@app.route("/", methods=["POST"])
+    ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
+    ws.run_forever()
+
+# دالة لفحص العملات المسجلة وتشغيل WebSocket عليها
+def watcher_loop():
+    watched = set()
+    while True:
+        coins = r.smembers("coins")
+        symbols = {coin.decode('utf-8') for coin in coins}
+        new_symbols = symbols - watched
+        for symbol in new_symbols:
+            threading.Thread(target=watch_price, args=(symbol,)).start()
+            watched.add(symbol)
+        time.sleep(5)
+
+# نقطة بداية البوت
+@app.route('/')
+def home():
+    return "Bot Running"
+
+@app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.json
-    msg = data.get("message", {}).get("text", "")
-    if not msg: return "no text"
-
-    msg = msg.lower()
-    if msg.startswith("سجل"):
-        tokens = msg.split()[1:]
+    data = request.get_json()
+    message = data.get("message", {}).get("text", "").lower()
+    if message.startswith("سجل"):
+        tokens = message.split()[1:]
         added = []
-        for t in tokens:
-            t = t.upper() + "USDT"
-            r.sadd("coins", t)
-            added.append(t)
-        send_message(f"✅ تم تسجيل: {' - '.join(added)}")
-        return "added"
-
-    if msg.startswith("احذف الكل"):
+        for token in tokens:
+            full = f"{token.upper()}USDT"
+            r.sadd("coins", full)
+            added.append(full)
+        return f"✅ تم تسجيل: {' - '.join(added)}", 200
+    elif message == "احذف الكل":
         deleted = r.smembers("coins")
         r.delete("coins")
-        names = [d.decode() for d in deleted]
-        send_message(f"🗑️ تم حذف الكل:\n{', '.join(names)}")
-        return "deleted all"
+        names = [x.decode() for x in deleted]
+        return f"🗑️ تم حذف الكل: {', '.join(names)}", 200
+    return "تم", 200
 
-    if msg.startswith("احذف"):
-        coin = msg.split()[1].upper() + "USDT"
-        r.srem("coins", coin)
-        send_message(f"🗑️ تم حذف: {coin}")
-        return "deleted one"
-
-    if msg.startswith("شو سجلت"):
-        coins = r.smembers("coins")
-        if not coins:
-            send_message("📭 لا توجد عملات مسجلة.")
-        else:
-            c = [x.decode() for x in coins]
-            send_message("🔖 العملات المسجلة:\n" + "\n".join(c))
-        return "listed"
-
-    return "ok"
-
-if __name__ == "__main__":
-    send_message("✅ البوت اشتغل ويبدأ مراقبة العملات!")
-    threading.Thread(target=start_monitoring, daemon=True).start()
+# بدء الخيوط
+if __name__ == '__main__':
+    threading.Thread(target=watcher_loop).start()
     app.run(host="0.0.0.0", port=8080)
