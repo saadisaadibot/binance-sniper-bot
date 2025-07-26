@@ -40,7 +40,7 @@ def watch_price(symbol):
         if last_price and last_time:
             price_change = (price - last_price) / last_price * 100
             time_diff = now - last_time
-            if price_change >= 1.8 and time_diff <= 1:
+            if price_change >= 1.7 and time_diff <= 1:
                 coin = symbol.replace("USDT", "")
                 msg = f"اشتري {coin} يا توتو sniper"
                 send_message(msg)
@@ -84,7 +84,7 @@ def fetch_bitvavo_top_symbols():
                 coin["customChange"] = -999
 
         sorted_coins = sorted(eur_coins, key=lambda x: x["customChange"], reverse=True)
-        return [coin["market"].replace("-EUR", "").upper() for coin in sorted_coins[:50]]
+        return [coin["market"].replace("-EUR", "").upper() for coin in sorted_coins[:80]]
     except Exception as e:
         print("فشل جلب العملات من Bitvavo:", e)
         return []
