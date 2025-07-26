@@ -12,7 +12,7 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 IS_RUNNING_KEY = "sniper_running"
-TOTO_WEBHOOK = "https://totozaghnot-production.up.railway.app/webhook"  # ✅ إضافة Webhook
+TOTO_WEBHOOK = "https://totozaghnot-production.up.railway.app/webhook"
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -28,15 +28,20 @@ def watch_price(symbol):
 
     last_price = None
     last_time = None
+    price_5s_ago = None
+    time_5s_ago = None
 
     def on_message(ws, message):
-        nonlocal last_price, last_time
+        nonlocal last_price, last_time, price_5s_ago, time_5s_ago
         if r.get(IS_RUNNING_KEY) != b"1":
             ws.close()
             return
+
         data = json.loads(message)
         price = float(data['c'])
         now = time.time()
+
+        # شرط 1: 1.7% خلال ثانية
         if last_price and last_time:
             price_change = (price - last_price) / last_price * 100
             time_diff = now - last_time
@@ -48,14 +53,34 @@ def watch_price(symbol):
                     requests.post(TOTO_WEBHOOK, json={"message": {"text": msg}})
                 except Exception as e:
                     print("فشل إرسال الإشعار إلى توتو:", e)
+
+        # شرط 2: 3% خلال 5 ثواني
+        if price_5s_ago and time_5s_ago:
+            change_5s = (price - price_5s_ago) / price_5s_ago * 100
+            diff_5s = now - time_5s_ago
+            if change_5s >= 3 and diff_5s <= 5:
+                coin = symbol.replace("USDT", "")
+                msg = f"اشتري {coin} يا توتو sniper"
+                send_message(msg)
+                try:
+                    requests.post(TOTO_WEBHOOK, json={"message": {"text": msg}})
+                except Exception as e:
+                    print("فشل إرسال الإشعار إلى توتو:", e)
+
         last_price = price
         last_time = now
+
+        if not time_5s_ago or (now - time_5s_ago) >= 5:
+            price_5s_ago = price
+            time_5s_ago = now
 
     def on_error(ws, error):
         print(f"[{symbol}] خطأ:", error)
 
     def on_close(ws):
-        print(f"[{symbol}] تم الإغلاق - سيتم إعادة المحاولة لاحقًا")
+        print(f"[{symbol}] تم الإغلاق - إعادة التشغيل...")
+        time.sleep(2)
+        threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
 
     ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
