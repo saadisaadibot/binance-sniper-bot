@@ -83,7 +83,7 @@ def watch_price(symbol):
             if price_5s_ago and time_5s_ago:
                 change_5s = (price - price_5s_ago) / price_5s_ago * 100
                 diff_5s = now - time_5s_ago
-                if change_5s >= 2 and diff_5s <= 5:
+                if change_5s >= 1.8 and diff_5s <= 3.5:
                     msg = f"اشتري {coin} يا نمس Sniper"
                     send_message(msg)
                     try:
