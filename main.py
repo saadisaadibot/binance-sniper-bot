@@ -144,14 +144,16 @@ def update_symbols_loop():
 
         matched = []
         for c in bitvavo:
-            symbol = f"{c}USDT"
-            if symbol in binance:
-                matched.append(c)
+            possible_pairs = [f"{c}USDT", f"{c}BTC", f"{c}ETH", f"{c}BNB"]
+            for symbol in possible_pairs:
+                if symbol in binance:
+                    matched.append(symbol)
+                    break
 
         if matched:
             for sym in matched:
-                r.sadd("coins", f"{sym}USDT")
-            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in matched]))
+                r.sadd("coins", sym)
+            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m.replace('USDT', '')}" for m in matched]))
         else:
             print("⚠️ لم يتم العثور على رموز متطابقة.")
             send_message("🚫 لا توجد عملات قابلة للمراقبة حالياً.")
