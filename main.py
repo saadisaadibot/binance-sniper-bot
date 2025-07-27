@@ -91,13 +91,13 @@ def fetch_bitvavo_top_symbols():
         res = requests.get(url)
         data = res.json()
 
-        # ✅ ناخد كل الأزواج اللي فيها "-" واسم العملة طوله طبيعي
-        valid_coins = [
-            d for d in data
-            if "-" in d.get("market", "") and len(d["market"].split("-")[0]) >= 2
+        eur_coins = [
+            d for d in data 
+            if d.get("market", "").endswith("-EUR") 
+            and len(d.get("market", "")) > 5
         ]
 
-        for coin in valid_coins:
+        for coin in eur_coins:
             try:
                 open_price = float(coin.get("open", "0"))
                 last_price = float(coin.get("last", "0"))
@@ -109,10 +109,8 @@ def fetch_bitvavo_top_symbols():
             except:
                 coin["customChange"] = -999
 
-        sorted_coins = sorted(valid_coins, key=lambda x: x["customChange"], reverse=True)
-
-        # ✅ نحول الزوج من BTC-EUR إلى BTCEUR لتتطابق مع Binance
-        return [coin["market"].replace("-", "").upper() for coin in sorted_coins[:80]]
+        sorted_coins = sorted(eur_coins, key=lambda x: x["customChange"], reverse=True)
+        return [coin["market"].replace("-EUR", "").upper() for coin in sorted_coins[:80]]
     except Exception as e:
         print("فشل جلب العملات من Bitvavo:", e)
         return []
