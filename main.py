@@ -90,13 +90,14 @@ def fetch_bitvavo_top_symbols():
         url = "https://api.bitvavo.com/v2/ticker/24h"
         res = requests.get(url)
         data = res.json()
-        eur_coins = [
-            d for d in data 
-            if d.get("market", "").endswith("-EUR") 
-            and len(d.get("market", "")) > 5
+
+        # ✅ ناخد كل الأزواج اللي اسمها مثل BTC-EUR, ETH-USDT, ... 
+        valid_coins = [
+            d for d in data
+            if "-" in d.get("market", "") and len(d["market"].split("-")[0]) >= 2
         ]
 
-        for coin in eur_coins:
+        for coin in valid_coins:
             try:
                 open_price = float(coin.get("open", "0"))
                 last_price = float(coin.get("last", "0"))
@@ -108,8 +109,10 @@ def fetch_bitvavo_top_symbols():
             except:
                 coin["customChange"] = -999
 
-        sorted_coins = sorted(eur_coins, key=lambda x: x["customChange"], reverse=True)
-        return [coin["market"].replace("-EUR", "").upper() for coin in sorted_coins[:80]]
+        sorted_coins = sorted(valid_coins, key=lambda x: x["customChange"], reverse=True)
+
+        # ✅ إعادة تنسيق الأزواج لتصبح مثل: BTCUSDT أو ETHBTC لتطابق Binance
+        return [coin["market"].replace("-", "").upper() for coin in sorted_coins[:80]]
     except Exception as e:
         print("فشل جلب العملات من Bitvavo:", e)
         return []
