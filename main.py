@@ -1,166 +1,195 @@
-import os, json, time, redis, threading, requests
-from flask import Flask, request
-from python_bitvavo_api.bitvavo import Bitvavo
+import os
+import json
+import time
+import redis
+import threading
+import requests
+from flask import Flask, request, jsonify
+from websocket import WebSocketApp
 
 app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
-
-bitvavo = Bitvavo({
-    'APIKEY': os.getenv("BITVAVO_API_KEY"),
-    'APISECRET': os.getenv("BITVAVO_API_SECRET"),
-    'RESTURL': 'https://api.bitvavo.com/v2',
-    'WSURL': 'wss://ws.bitvavo.com/v2/'
-})
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TOUTO_CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID")
+IS_RUNNING_KEY = "sniper_running"
 TOTO_WEBHOOK = "https://totozaghnot-production.up.railway.app/webhook"
 
-SNIPER_MODE = {"active": False}
-SNIPER_LAST_ALERT = {}
-
-# ========== أدوات أساسية ==========
 def send_message(text):
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={
-            "chat_id": TOUTO_CHAT_ID,
-            "text": text
-        })
-    except:
-        pass
-
-def send_to_toto(symbol, mode):
-    try:
-        base = symbol.split("-")[0]
-        requests.post(TOTO_WEBHOOK, json={"message": {"text": f"اشتري {base} يا توتو {mode}"}})
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text}
+        )
     except Exception as e:
-        print(f"[Webhook Error] {e}")
+        print("فشل إرسال الرسالة:", e)
 
-# ========== Ridder Score (آخر 15 دقيقة فقط) ==========
-def ridder_score(symbol):
+def fetch_bitvavo_symbols():
     try:
-        candles = bitvavo.candles(symbol, '1m', {'limit': 15})
-        if len(candles) < 3:
-            return 0
-
-        total_volume = sum([float(c[5]) for c in candles])
-        if total_volume < 10000:
-            return 0
-
-        recent = candles[-3:]
-        change = (float(recent[-1][4]) - float(recent[0][1])) / float(recent[0][1]) * 100
-        avg_range = sum([abs(float(c[2]) - float(c[3])) for c in recent]) / 3
-        avg_volume = sum([float(c[5]) for c in recent]) / 3
-
-        return change * avg_range * avg_volume
+        res = requests.get("https://api.bitvavo.com/v2/markets")
+        data = res.json()
+        return set(m["market"].replace("-EUR", "").upper() for m in data if m["market"].endswith("-EUR"))
     except:
-        return 0
+        return set()
 
-# ========== الفلتر الذكي ==========
-def smart_filter():
-    while True:
-        for key in list(r.scan_iter("ridder:*")):
-            symbol = key.decode().split(":")[1]
+def fetch_binance_top_matched():
+    try:
+        # جلب رموز Bitvavo أولاً
+        bitvavo_symbols = fetch_bitvavo_symbols()
+        if not bitvavo_symbols:
+            return []
+
+        # جلب رموز Binance النشطة
+        exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo").json()
+        binance_usdt_pairs = [
+            s["symbol"] for s in exchange_info["symbols"]
+            if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
+        ]
+
+        # مطابقة الرموز بين Bitvavo و Binance
+        matched = [sym for sym in binance_usdt_pairs if sym.replace("USDT", "") in bitvavo_symbols]
+
+        top_changes = []
+        for sym in matched:
             try:
-                data = json.loads(r.get(key))
-                if data.get("notified"):
+                url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=15m&limit=2"
+                data = requests.get(url).json()
+                if len(data) < 2:
                     continue
-
-                candles = bitvavo.candles(symbol, '1m', {'limit': 5})
-                if len(candles) < 5:
-                    continue
-
-                prices = [float(c[4]) for c in candles]
-                volumes = [float(c[5]) for c in candles]
-                avg_volume = sum(volumes[:-1]) / (len(volumes) - 1)
-                last_volume = volumes[-1]
-                price_jump = prices[-1] / prices[0]
-
-                if last_volume > avg_volume * 2.5 and price_jump > 1.018:
-                    data["notified"] = True
-                    r.set(key, json.dumps(data))
-                    send_message(f"🚀 اشترِ {symbol} يا توتو Ridder")
-                    send_to_toto(symbol, "Ridder")
-
-                elif SNIPER_MODE["active"]:
-                    if last_volume > avg_volume * 1.5 and price_jump > 1.007:
-                        now = time.time()
-                        last = SNIPER_LAST_ALERT.get(symbol, 0)
-                        if now - last > 180:
-                            SNIPER_LAST_ALERT[symbol] = now
-                            send_message(f"👀 انفجار صغير محتمل: {symbol}")
-                            try:
-                                base = symbol.split("-")[0]
-                                requests.post("https://alnemsbot-production.up.railway.app/webhook", json={
-                                    "message": {"text": f"اشتري {base} يا نمس"}
-                                })
-                            except Exception as e:
-                                print(f"[Webhook to Nems Failed] {e}")
-
-            except Exception as e:
-                print(f"[Smart Filter Error] {e}")
-        time.sleep(1)
-
-# ========== Ridder Loop (تحديث Top 50 فقط) ==========
-def run_ridder_loop():
-    while True:
-        try:
-            markets = bitvavo.markets()
-            symbols = [m['market'] for m in markets if m['quote'] == 'EUR']
-            scored = [(s, ridder_score(s)) for s in symbols]
-            top = sorted(scored, key=lambda x: x[1], reverse=True)[:50]
-
-            existing_keys = set(k.decode().split(":")[1] for k in r.scan_iter("ridder:*"))
-            new_symbols = set([s for s, _ in top])
-
-            to_add = new_symbols - existing_keys
-            for symbol in to_add:
-                r.set(f"ridder:{symbol}", json.dumps({"start": time.time(), "notified": False}))
-                print(f"[+] تمت إضافة عملة جديدة للمراقبة: {symbol}")
-
-        except Exception as e:
-            print(f"[Ridder Error] {e}")
-        time.sleep(90)
-
-# ========== تنظيف العملات بعد 15 دقيقة ==========
-def cleanup_expired():
-    while True:
-        for key in r.scan_iter("ridder:*"):
-            try:
-                data = json.loads(r.get(key))
-                if time.time() - data["start"] > 900:
-                    r.delete(key)
+                open_price = float(data[-2][1])
+                close_price = float(data[-2][4])
+                change = ((close_price - open_price) / open_price) * 100
+                top_changes.append((sym, change))
+                time.sleep(0.05)  # منع ضغط على Binance
             except:
                 continue
-        time.sleep(60)
 
-# ========== Webhook تلغرام ==========
-@app.route("/", methods=["POST"])
-def webhook():
-    data = request.json
-    msg = data.get("message", {}).get("text", "").lower()
-    chat_id = str(data.get("message", {}).get("chat", {}).get("id", ""))
-    if chat_id != str(TOUTO_CHAT_ID): return "ok"
+        sorted_top = sorted(top_changes, key=lambda x: x[1], reverse=True)
+        return [s[0] for s in sorted_top[:50]]
+    except Exception as e:
+        print("فشل جلب البيانات:", e)
+        return []
 
-    if msg == "شو عم تعمل":
-        ridder = [k.decode().split(":")[1] for k in r.scan_iter("ridder:*")]
-        reply = "🚨 Ridder:\n" + "\n".join(ridder) if ridder else "🚨 لا عملات في Ridder"
-        send_message(reply)
+def update_symbols_loop():
+    while True:
+        if r.get(IS_RUNNING_KEY) != b"1":
+            time.sleep(5)
+            continue
 
-    elif msg == "افتح الجدار":
-        SNIPER_MODE["active"] = True
-        send_message("✅ تم تفعيل Sniper Mode! أي حركة غير مؤكدة سيتم إرسالها لك مباشرة.")
+        r.delete("coins")
+        top_symbols = fetch_binance_top_matched()
+        if top_symbols:
+            for sym in top_symbols:
+                r.sadd("coins", sym)
+            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {s.replace('USDT','')}" for s in top_symbols]))
+        else:
+            send_message("🚫 لا توجد عملات قابلة للمراقبة حالياً.")
 
-    elif msg == "اغلق الجدار":
-        SNIPER_MODE["active"] = False
-        send_message("🔕 تم إغلاق Sniper Mode. توقفت إشعارات الحركات غير المؤكدة.")
+        time.sleep(600)
 
-    return "ok"
+def watch_price(symbol):
+    stream = f"{symbol.lower()}@ticker"
+    url = f"wss://stream.binance.com:9443/ws/{stream}"
+    last_price = None
+    last_time = None
+    price_5s_ago = None
+    time_5s_ago = None
 
-# ========== التشغيل ==========
+    def on_message(ws, message):
+        nonlocal last_price, last_time, price_5s_ago, time_5s_ago
+        if r.get(IS_RUNNING_KEY) != b"1":
+            ws.close()
+            return
+
+        data = json.loads(message)
+        price = float(data['c'])
+        now = time.time()
+        coin = symbol.replace("USDT", "")
+
+        # شرط 1: 1.5% خلال ثانية
+        if last_price and last_time:
+            change = (price - last_price) / last_price * 100
+            diff = now - last_time
+            if change >= 1.5 and diff <= 1:
+                msg = f"اشتري {coin} يا توتو sniper"
+                send_message(msg)
+                try:
+                    requests.post(TOTO_WEBHOOK, json={"message": {"text": msg}})
+                except:
+                    pass
+
+        # شرط 2: 2.5% خلال 5 ثواني
+        if price_5s_ago and time_5s_ago:
+            change = (price - price_5s_ago) / price_5s_ago * 100
+            diff = now - time_5s_ago
+            if change >= 2.5 and diff <= 5:
+                msg = f"اشتري {coin} يا توتو sniper"
+                send_message(msg)
+                try:
+                    requests.post(TOTO_WEBHOOK, json={"message": {"text": msg}})
+                except:
+                    pass
+
+        last_price = price
+        last_time = now
+        if not time_5s_ago or (now - time_5s_ago) >= 5:
+            price_5s_ago = price
+            time_5s_ago = now
+
+    def on_error(ws, error):
+        print(f"[{symbol}] خطأ:", error)
+
+    def on_close(ws):
+        print(f"[{symbol}] تم الإغلاق - إعادة التشغيل...")
+        time.sleep(2)
+        threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
+
+    ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
+    ws.run_forever()
+
+def watcher_loop():
+    watched = set()
+    while True:
+        if r.get(IS_RUNNING_KEY) != b"1":
+            time.sleep(5)
+            continue
+        coins = r.smembers("coins")
+        symbols = {c.decode() for c in coins}
+        for sym in symbols - watched:
+            threading.Thread(target=watch_price, args=(sym,), daemon=True).start()
+            watched.add(sym)
+        time.sleep(1)
+
+@app.route("/")
+def home():
+    return "🔥 Sniper Mode is Live", 200
+
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json()
+    if not data or "message" not in data:
+        return jsonify(success=True)
+    text = data["message"].get("text", "").strip().lower()
+    if text == "play":
+        r.set(IS_RUNNING_KEY, "1")
+        send_message("✅ بدأ التشغيل Sniper.")
+        coins = r.smembers("coins")
+        coin_list = [c.decode().replace("USDT", "") for c in coins]
+        if coin_list:
+            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in coin_list]))
+    elif text == "stop":
+        r.set(IS_RUNNING_KEY, "0")
+        send_message("🛑 تم إيقاف Sniper مؤقتًا.")
+    elif text == "السجل":
+        coins = r.smembers("coins")
+        coin_list = [c.decode().replace("USDT", "") for c in coins]
+        if coin_list:
+            send_message("📡 العملات المرصودة:\n" + "\n".join(coin_list))
+        else:
+            send_message("🚫 لا توجد عملات قيد المراقبة حالياً.")
+    return jsonify(ok=True)
+
 if __name__ == "__main__":
-    for key in r.scan_iter("*"): r.delete(key)
-    threading.Thread(target=run_ridder_loop).start()
-    threading.Thread(target=smart_filter).start()
-    threading.Thread(target=cleanup_expired).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+    r.set(IS_RUNNING_KEY, "1")
+    threading.Thread(target=update_symbols_loop, daemon=True).start()
+    threading.Thread(target=watcher_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=8080)
