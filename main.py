@@ -55,7 +55,7 @@ def update_trends_loop():
                 key = f"{WATCH_KEY}:{symbol}"
                 if not r.exists(key):
                     r.setex(key, 1800, "1")  # راقب نصف ساعة
-                     r.sadd("watched_trend_coins", symbol)  # أضف للعملات المرصودة
+                    r.sadd("watched_trend_coins", symbol)  # أضف للعملات المرصودة
                     new_coins.append(symbol)
                     threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
 
