@@ -143,6 +143,12 @@ def watch_price(symbol):
             return
 
         data = json.loads(message)
+        
+        # ✅ حماية من غياب "c"
+        if "c" not in data:
+            print(f"[{symbol}] ⚠️ لا يوجد المفتاح 'c' في الرسالة: {data}")
+            return
+
         price = float(data["c"])
         now = time.time()
         coin = symbol.replace("USDT", "")
