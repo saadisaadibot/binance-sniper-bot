@@ -1,3 +1,4 @@
+pytrends
 binance-connector
 flask
 redis
