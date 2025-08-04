@@ -6,6 +6,7 @@ import threading
 import requests
 from flask import Flask, request, jsonify
 from websocket import WebSocketApp
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
@@ -31,42 +32,50 @@ def fetch_bitvavo_symbols():
     except:
         return set()
 
+def fetch_change(sym, interval):
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit=2"
+        res = requests.get(url, timeout=3)
+        data = res.json()
+        if len(data) < 2:
+            return None
+        open_price = float(data[-2][1])
+        close_price = float(data[-2][4])
+        change = ((close_price - open_price) / open_price) * 100
+        return (sym, change)
+    except:
+        return None
+
 def fetch_binance_top_matched():
     try:
         bitvavo_symbols = fetch_bitvavo_symbols()
         if not bitvavo_symbols:
             return []
 
-        exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo").json()
+        exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
         binance_usdt_pairs = [
             s["symbol"] for s in exchange_info["symbols"]
             if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
         ]
 
         matched = [sym for sym in binance_usdt_pairs if sym.replace("USDT", "") in bitvavo_symbols]
+        matched = matched[:100]  # نراقب فقط أول 100 عملة لتقليل الضغط
 
         all_changes = {}
 
         def collect_top(interval, count):
             local_changes = []
-            for sym in matched:
-                try:
-                    url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit=2"
-                    data = requests.get(url).json()
-                    if len(data) < 2:
-                        continue
-                    open_price = float(data[-2][1])
-                    close_price = float(data[-2][4])
-                    change = ((close_price - open_price) / open_price) * 100
-                    local_changes.append((sym, change))
-                    time.sleep(0.05)
-                except:
-                    continue
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                results = executor.map(lambda sym: fetch_change(sym, interval), matched)
+                for res in results:
+                    if res:
+                        local_changes.append(res)
+
             sorted_changes = sorted(local_changes, key=lambda x: x[1], reverse=True)
             for sym, change in sorted_changes[:count]:
                 all_changes[sym] = change
 
-        # ⏱️ نجمع من كل فريم
+        # ⏱️ جمع من كل فريم
         collect_top("15m", 10)
         collect_top("10m", 10)
         collect_top("5m", 10)
