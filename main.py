@@ -24,6 +24,15 @@ def send_message(text):
     except Exception as e:
         print("✖️ فشل إرسال الرسالة:", e)
 
+# 📦 جلب رموز العملات المتاحة في Bitvavo
+def get_bitvavo_symbols():
+    try:
+        res = requests.get("https://api.bitvavo.com/v2/markets")
+        data = res.json()
+        return set(m["market"].split("-")[0].upper() for m in data)
+    except:
+        return set()
+
 # 🧠 ترندات Google
 def get_google_trends():
     try:
@@ -44,18 +53,21 @@ def get_coingecko_trends():
     except:
         return []
 
-# 🔁 جلب ترندات كل دقيقة
+# 🔁 جلب الترندات كل دقيقة
 def update_trends_loop():
+    allowed = get_bitvavo_symbols()
+
     while True:
         try:
-            all = set(get_coingecko_trends() + get_google_trends())
+            trends = set(get_coingecko_trends() + get_google_trends())
+            filtered = [symbol for symbol in trends if symbol in allowed]
             new_coins = []
 
-            for symbol in all:
+            for symbol in filtered:
                 key = f"{WATCH_KEY}:{symbol}"
                 if not r.exists(key):
                     r.setex(key, 1800, "1")  # راقب نصف ساعة
-                    r.sadd("watched_trend_coins", symbol)  # أضف للعملات المرصودة
+                    r.sadd("watched_trend_coins", symbol)
                     new_coins.append(symbol)
                     threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
 
@@ -67,7 +79,7 @@ def update_trends_loop():
 
         time.sleep(60)
 
-# 👁️‍🗨️ راقب السعر من Binance
+# 👁️‍🗨️ راقب السعر
 def watch_price(symbol):
     stream = f"{symbol.lower()}usdt@ticker"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
@@ -83,18 +95,16 @@ def watch_price(symbol):
         price = float(data.get("c", 0))
         now = time.time()
 
-        # انفجار 1.5% خلال ثانية
+        # انفجار 1.5% خلال 1s
         if last_price and last_time:
             change = (price - last_price) / last_price * 100
-            diff = now - last_time
-            if change >= 1.5 and diff <= 1:
+            if change >= 1.5 and (now - last_time) <= 1:
                 send_message(f"🚀 انفجار 1s: {symbol} ارتفع {change:.2f}%")
 
-        # انفجار 2.5% خلال 5 ثواني
+        # انفجار 2.5% خلال 5s
         if price_5s_ago and time_5s_ago:
             change = (price - price_5s_ago) / price_5s_ago * 100
-            diff = now - time_5s_ago
-            if change >= 2.5 and diff <= 5:
+            if change >= 2.5 and (now - time_5s_ago) <= 5:
                 send_message(f"🚀 انفجار 5s: {symbol} ارتفع {change:.2f}%")
 
         last_price = price
@@ -113,7 +123,7 @@ def watch_price(symbol):
     ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
 
-# 🛰️ نقطة التأكد من التشغيل
+# 🛰️ نقطة التشغيل
 @app.route("/")
 def home():
     return "Trend Sniper is alive ✅", 200
@@ -142,7 +152,7 @@ def telegram_webhook():
     elif text == "انسى كل شي":
         r.delete("watched_trend_coins")
         send_message("🧹 تم حذف كل العملات من قائمة المراقبة.")
-    
+
     return jsonify(ok=True)
 
 # 🚀 بدء التشغيل
