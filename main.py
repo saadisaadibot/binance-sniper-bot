@@ -151,7 +151,11 @@ def telegram_webhook():
         send_message(msg)
     elif text == "انسى كل شي":
         r.delete("watched_trend_coins")
-        send_message("🧹 تم حذف كل العملات من قائمة المراقبة.")
+
+        for key in r.scan_iter(f"{WATCH_KEY}:*"):
+            r.delete(key)
+
+        send_message("🧹 تم حذف كل العملات من Redis وقائمة المراقبة.")
 
     return jsonify(ok=True)
 
