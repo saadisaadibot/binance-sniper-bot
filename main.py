@@ -117,6 +117,33 @@ def watch_price(symbol):
 def home():
     return "Trend Sniper is alive ✅", 200
 
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json()
+    if not data or "message" not in data:
+        return jsonify(ok=True)
+
+    text = data["message"].get("text", "").strip().lower()
+
+    if text == "ابدأ":
+        r.set("trendbot_running", "1")
+        send_message("✅ بدأ العمل على مراقبة الترند.")
+    elif text == "قف":
+        r.set("trendbot_running", "0")
+        send_message("🛑 تم إيقاف مراقبة الترند.")
+    elif text == "الترند":
+        coins = r.smembers("watched_trend_coins")
+        if coins:
+            msg = "👁️‍🗨️ العملات التي تتم مراقبتها الآن:\n" + " ".join(c.decode() for c in coins)
+        else:
+            msg = "🚫 لا توجد عملات قيد المراقبة حالياً."
+        send_message(msg)
+    elif text == "انسى كل شي":
+        r.delete("watched_trend_coins")
+        send_message("🧹 تم حذف كل العملات من قائمة المراقبة.")
+    
+    return jsonify(ok=True)
+
 # 🚀 بدء التشغيل
 if __name__ == "__main__":
     threading.Thread(target=update_trends_loop, daemon=True).start()
