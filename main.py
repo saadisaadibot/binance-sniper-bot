@@ -148,11 +148,11 @@ def watch_price(symbol):
         coin = symbol.replace("USDT", "")
 
         # 💥 إشارات الانفجار
-        if price_5s and now - time_5s <= 5 and (price - price_5s) / price_5s * 100 >= 2:
+        if price_5s and now - time_5s <= 5 and (price - price_5s) / price_5s * 100 >= 1.5:
             notify_buy(coin, "5")
-        if price_10s and now - time_10s <= 10 and (price - price_10s) / price_10s * 100 >= 3:
+        if price_10s and now - time_10s <= 10 and (price - price_10s) / price_10s * 100 >= 2:
             notify_buy(coin, "10")
-        if price_120s and now - time_120s <= 120 and (price - price_120s) / price_120s * 100 >= 4:
+        if price_120s and now - time_120s <= 120 and (price - price_120s) / price_120s * 100 >= 3:
             notify_buy(coin, "120")
 
         # 🕒 تحديث الأسعار المرجعية
