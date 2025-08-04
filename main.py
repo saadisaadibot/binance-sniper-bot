@@ -6,15 +6,15 @@ import threading
 import requests
 from flask import Flask, request, jsonify
 from websocket import WebSocketApp
-from pytrends.request import TrendReq
 
 app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-WATCH_KEY = "trends:watching"
+IS_RUNNING_KEY = "sniper_running"
 
-# 🔥 إرسال رسالة تلغرام
+SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/webhook"
+
 def send_message(text):
     try:
         requests.post(
@@ -22,142 +22,187 @@ def send_message(text):
             data={"chat_id": CHAT_ID, "text": text}
         )
     except Exception as e:
-        print("✖️ فشل إرسال الرسالة:", e)
+        print("فشل إرسال الرسالة:", e)
 
-# 📦 جلب رموز العملات المتاحة في Bitvavo
-def get_bitvavo_symbols():
+def fetch_bitvavo_symbols():
     try:
         res = requests.get("https://api.bitvavo.com/v2/markets")
         data = res.json()
-        return set(m["market"].split("-")[0].upper() for m in data if m["market"].endswith("-EUR"))
+        return set(m["market"].replace("-EUR", "").upper() for m in data if m["market"].endswith("-EUR"))
     except:
         return set()
 
-BITVAVO_SYMBOLS = get_bitvavo_symbols()
-
-# 🧠 ترندات Google
-def get_google_trends():
+def fetch_binance_top_matched():
     try:
-        pytrends = TrendReq()
-        df = pytrends.trending_searches(pn="global")
-        return [x.strip().upper().replace(" ", "") for x in df[0].tolist()]
-    except:
+        bitvavo_symbols = fetch_bitvavo_symbols()
+        if not bitvavo_symbols:
+            return []
+
+        exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo").json()
+        binance_usdt_pairs = [
+            s["symbol"] for s in exchange_info["symbols"]
+            if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
+        ]
+
+        matched = [sym for sym in binance_usdt_pairs if sym.replace("USDT", "") in bitvavo_symbols]
+
+        top_changes = []
+        for sym in matched:
+            try:
+                url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=15m&limit=2"
+                data = requests.get(url).json()
+                if len(data) < 2:
+                    continue
+                open_price = float(data[-2][1])
+                close_price = float(data[-2][4])
+                change = ((close_price - open_price) / open_price) * 100
+                top_changes.append((sym, change))
+                time.sleep(0.05)
+            except:
+                continue
+
+        sorted_top = sorted(top_changes, key=lambda x: x[1], reverse=True)
+        return [s[0] for s in sorted_top[:50]]
+    except Exception as e:
+        print("فشل جلب البيانات:", e)
         return []
 
-# 🧠 ترندات CoinGecko
-def get_coingecko_trends():
-    try:
-        url = "https://api.coingecko.com/api/v3/search/trending"
-        res = requests.get(url)
-        data = res.json()
-        coins = [c["item"]["symbol"].upper() for c in data.get("coins", [])]
-        return coins
-    except:
-        return []
-
-# 🔁 جلب الترندات كل دقيقة
-def update_trends_loop():
+def update_symbols_loop():
     while True:
-        try:
-            trends = set(get_coingecko_trends() + get_google_trends())
-            filtered = [symbol for symbol in trends if symbol in BITVAVO_SYMBOLS]
-            new_coins = []
+        if r.get(IS_RUNNING_KEY) != b"1":
+            time.sleep(5)
+            continue
 
-            for symbol in filtered:
-                key = f"{WATCH_KEY}:{symbol}"
-                if not r.exists(key):
-                    r.setex(key, 1800, "1")  # راقب نصف ساعة
-                    r.sadd("watched_trend_coins", symbol)
-                    new_coins.append(symbol)
-                    threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
+        r.delete("coins")
+        top_symbols = fetch_binance_top_matched()
+        if top_symbols:
+            for sym in top_symbols:
+                r.sadd("coins", sym)
+            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {s.replace('USDT','')}" for s in top_symbols]))
+        else:
+            send_message("🚫 لا توجد عملات قابلة للمراقبة حالياً.")
 
-            if new_coins:
-                send_message(f"📡 بدأ مراقبة: {' '.join(new_coins)}")
+        time.sleep(600)
 
-        except Exception as e:
-            print("✖️ خطأ بجلب الترندات:", e)
+def notify_buy(coin, tag):
+    msg = f"🚀 انفجار {tag}: {coin} #{tag}"
+    send_message(msg)
+    try:
+        requests.post(SAQAR_WEBHOOK, json={"message": {"text": f"اشتري {coin}"}})
+    except:
+        pass
 
-        time.sleep(60)
-
-# 👁️‍🗨️ راقب السعر
 def watch_price(symbol):
-    stream = f"{symbol.lower()}usdt@ticker"
+    stream = f"{symbol.lower()}@ticker"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
-
     last_price = None
     last_time = None
-    price_5s_ago = None
-    time_5s_ago = None
+    price_5s = None
+    time_5s = None
+    price_10s = None
+    time_10s = None
+    price_60s = None
+    time_60s = None
 
     def on_message(ws, message):
-        nonlocal last_price, last_time, price_5s_ago, time_5s_ago
+        nonlocal last_price, last_time, price_5s, time_5s, price_10s, time_10s, price_60s, time_60s
+        if r.get(IS_RUNNING_KEY) != b"1":
+            ws.close()
+            return
+
         data = json.loads(message)
-        price = float(data.get("c", 0))
+        price = float(data["c"])
         now = time.time()
+        coin = symbol.replace("USDT", "")
 
-        # انفجار 1.5% خلال 1s
-        if last_price and last_time:
-            change = (price - last_price) / last_price * 100
-            if change >= 1.5 and (now - last_time) <= 1:
-                send_message(f"🚀 انفجار 1s: {symbol} ارتفع {change:.2f}%")
+        # ⏱️ انفجار 2% خلال 5 ثواني
+        if price_5s and time_5s:
+            change = (price - price_5s) / price_5s * 100
+            if change >= 2 and now - time_5s <= 5:
+                notify_buy(coin, "5")
 
-        # انفجار 2.5% خلال 5s
-        if price_5s_ago and time_5s_ago:
-            change = (price - price_5s_ago) / price_5s_ago * 100
-            if change >= 2.5 and (now - time_5s_ago) <= 5:
-                send_message(f"🚀 انفجار 5s: {symbol} ارتفع {change:.2f}%")
+        # ⏱️ انفجار 3% خلال 10 ثواني
+        if price_10s and time_10s:
+            change = (price - price_10s) / price_10s * 100
+            if change >= 3 and now - time_10s <= 10:
+                notify_buy(coin, "10")
+
+        # ⏱️ انفجار 4% خلال دقيقة
+        if price_60s and time_60s:
+            change = (price - price_60s) / price_60s * 100
+            if change >= 4 and now - time_60s <= 60:
+                notify_buy(coin, "60")
 
         last_price = price
         last_time = now
 
-        if not time_5s_ago or (now - time_5s_ago) >= 5:
-            price_5s_ago = price
-            time_5s_ago = now
+        if not time_5s or now - time_5s >= 5:
+            price_5s = price
+            time_5s = now
+
+        if not time_10s or now - time_10s >= 10:
+            price_10s = price
+            time_10s = now
+
+        if not time_60s or now - time_60s >= 60:
+            price_60s = price
+            time_60s = now
 
     def on_error(ws, error):
-        print(f"[{symbol}] WebSocket Error:", error)
+        print(f"[{symbol}] خطأ:", error)
 
     def on_close(ws):
-        print(f"[{symbol}] WebSocket Closed")
+        print(f"[{symbol}] تم الإغلاق - إعادة التشغيل...")
+        time.sleep(2)
+        threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
 
     ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
 
-# 🛰️ نقطة التشغيل
+def watcher_loop():
+    watched = set()
+    while True:
+        if r.get(IS_RUNNING_KEY) != b"1":
+            time.sleep(5)
+            continue
+        coins = r.smembers("coins")
+        symbols = {c.decode() for c in coins}
+        for sym in symbols - watched:
+            threading.Thread(target=watch_price, args=(sym,), daemon=True).start()
+            watched.add(sym)
+        time.sleep(1)
+
 @app.route("/")
 def home():
-    return "Trend Sniper is alive ✅", 200
+    return "🔥 Sniper Mode is Live", 200
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     data = request.get_json()
     if not data or "message" not in data:
-        return jsonify(ok=True)
-
+        return jsonify(success=True)
     text = data["message"].get("text", "").strip().lower()
-
-    if text == "ابدأ":
-        r.set("trendbot_running", "1")
-        send_message("✅ بدأ العمل على مراقبة الترند.")
-    elif text == "قف":
-        r.set("trendbot_running", "0")
-        send_message("🛑 تم إيقاف مراقبة الترند.")
-    elif text == "الترند":
-        coins = r.smembers("watched_trend_coins")
-        if coins:
-            msg = "👁️‍🗨️ العملات التي تتم مراقبتها الآن:\n" + " ".join(c.decode() for c in coins)
+    if text == "play":
+        r.set(IS_RUNNING_KEY, "1")
+        send_message("✅ بدأ التشغيل Sniper.")
+        coins = r.smembers("coins")
+        coin_list = [c.decode().replace("USDT", "") for c in coins]
+        if coin_list:
+            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in coin_list]))
+    elif text == "stop":
+        r.set(IS_RUNNING_KEY, "0")
+        send_message("🛑 تم إيقاف Sniper مؤقتًا.")
+    elif text == "السجل":
+        coins = r.smembers("coins")
+        coin_list = [c.decode().replace("USDT", "") for c in coins]
+        if coin_list:
+            send_message("📡 العملات المرصودة:\n" + "\n".join(coin_list))
         else:
-            msg = "🚫 لا توجد عملات قيد المراقبة حالياً."
-        send_message(msg)
-    elif text == "انسى كل شي":
-        r.delete("watched_trend_coins")
-        for key in r.scan_iter(f"{WATCH_KEY}:*"):
-            r.delete(key)
-        send_message("🧹 تم حذف كل العملات من Redis وقائمة المراقبة.")
-
+            send_message("🚫 لا توجد عملات قيد المراقبة حالياً.")
     return jsonify(ok=True)
 
-# 🚀 بدء التشغيل
 if __name__ == "__main__":
-    threading.Thread(target=update_trends_loop, daemon=True).start()
+    r.set(IS_RUNNING_KEY, "1")
+    threading.Thread(target=update_symbols_loop, daemon=True).start()
+    threading.Thread(target=watcher_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
