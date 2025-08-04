@@ -131,7 +131,7 @@ def notify_buy(coin, tag):
         pass
 
 def watch_price(symbol):
-    stream = f"{symbol.lower()}@ticker"
+    stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
     price_5s = price_10s = price_120s = None
     time_5s = time_10s = time_120s = None
