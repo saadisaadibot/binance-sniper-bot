@@ -45,23 +45,35 @@ def fetch_binance_top_matched():
 
         matched = [sym for sym in binance_usdt_pairs if sym.replace("USDT", "") in bitvavo_symbols]
 
-        top_changes = []
-        for sym in matched:
-            try:
-                url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=15m&limit=2"
-                data = requests.get(url).json()
-                if len(data) < 2:
-                    continue
-                open_price = float(data[-2][1])
-                close_price = float(data[-2][4])
-                change = ((close_price - open_price) / open_price) * 100
-                top_changes.append((sym, change))
-                time.sleep(0.05)
-            except:
-                continue
+        all_changes = {}
 
-        sorted_top = sorted(top_changes, key=lambda x: x[1], reverse=True)
-        return [s[0] for s in sorted_top[:50]]
+        def collect_top(interval, count):
+            local_changes = []
+            for sym in matched:
+                try:
+                    url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit=2"
+                    data = requests.get(url).json()
+                    if len(data) < 2:
+                        continue
+                    open_price = float(data[-2][1])
+                    close_price = float(data[-2][4])
+                    change = ((close_price - open_price) / open_price) * 100
+                    local_changes.append((sym, change))
+                    time.sleep(0.05)
+                except:
+                    continue
+            sorted_changes = sorted(local_changes, key=lambda x: x[1], reverse=True)
+            for sym, change in sorted_changes[:count]:
+                all_changes[sym] = change
+
+        # ⏱️ نجمع من كل فريم
+        collect_top("15m", 10)
+        collect_top("10m", 10)
+        collect_top("5m", 10)
+
+        # 🔄 نرتبهم حسب التغير النهائي بعد الدمج
+        sorted_all = sorted(all_changes.items(), key=lambda x: x[1], reverse=True)
+        return [s[0] for s in sorted_all]
     except Exception as e:
         print("فشل جلب البيانات:", e)
         return []
