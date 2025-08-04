@@ -12,7 +12,6 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 IS_RUNNING_KEY = "sniper_running"
-
 SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/webhook"
 
 def send_message(text):
@@ -73,16 +72,34 @@ def update_symbols_loop():
             time.sleep(5)
             continue
 
-        r.delete("coins")
         top_symbols = fetch_binance_top_matched()
+        now = time.time()
+        count_added = 0
+
         if top_symbols:
             for sym in top_symbols:
-                r.sadd("coins", sym)
-            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {s.replace('USDT','')}" for s in top_symbols]))
+                if not r.hexists("watchlist", sym):
+                    r.hset("watchlist", sym, now)
+                    count_added += 1
+
+            symbols = [s.replace("USDT", "") for s in top_symbols]
+            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {s}" for s in symbols]))
         else:
             send_message("🚫 لا توجد عملات قابلة للمراقبة حالياً.")
 
-        time.sleep(600)
+        # 🧹 حذف العملات التي انتهت مدة مراقبتها
+        cleanup_old_coins()
+        time.sleep(180)  # كل 3 دقائق
+
+def cleanup_old_coins():
+    now = time.time()
+    for sym, ts in r.hgetall("watchlist").items():
+        try:
+            t = float(ts.decode())
+            if now - t > 1800:  # 30 دقيقة
+                r.hdel("watchlist", sym.decode())
+        except:
+            continue
 
 def notify_buy(coin, tag):
     msg = f"🚀 انفجار {tag}: {coin} #{tag}"
@@ -95,17 +112,11 @@ def notify_buy(coin, tag):
 def watch_price(symbol):
     stream = f"{symbol.lower()}@ticker"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
-    last_price = None
-    last_time = None
-    price_5s = None
-    time_5s = None
-    price_10s = None
-    time_10s = None
-    price_60s = None
-    time_60s = None
+    price_5s = price_10s = price_60s = None
+    time_5s = time_10s = time_60s = None
 
     def on_message(ws, message):
-        nonlocal last_price, last_time, price_5s, time_5s, price_10s, time_10s, price_60s, time_60s
+        nonlocal price_5s, time_5s, price_10s, time_10s, price_60s, time_60s
         if r.get(IS_RUNNING_KEY) != b"1":
             ws.close()
             return
@@ -115,48 +126,31 @@ def watch_price(symbol):
         now = time.time()
         coin = symbol.replace("USDT", "")
 
-        # ⏱️ انفجار 2% خلال 5 ثواني
-        if price_5s and time_5s:
-            change = (price - price_5s) / price_5s * 100
-            if change >= 2 and now - time_5s <= 5:
-                notify_buy(coin, "5")
-
-        # ⏱️ انفجار 3% خلال 10 ثواني
-        if price_10s and time_10s:
-            change = (price - price_10s) / price_10s * 100
-            if change >= 3 and now - time_10s <= 10:
-                notify_buy(coin, "10")
-
-        # ⏱️ انفجار 4% خلال دقيقة
-        if price_60s and time_60s:
-            change = (price - price_60s) / price_60s * 100
-            if change >= 4 and now - time_60s <= 60:
-                notify_buy(coin, "60")
-
-        last_price = price
-        last_time = now
+        if price_5s and now - time_5s <= 5 and (price - price_5s) / price_5s * 100 >= 2:
+            notify_buy(coin, "5")
+        if price_10s and now - time_10s <= 10 and (price - price_10s) / price_10s * 100 >= 3:
+            notify_buy(coin, "10")
+        if price_60s and now - time_60s <= 60 and (price - price_60s) / price_60s * 100 >= 4:
+            notify_buy(coin, "60")
 
         if not time_5s or now - time_5s >= 5:
             price_5s = price
             time_5s = now
-
         if not time_10s or now - time_10s >= 10:
             price_10s = price
             time_10s = now
-
         if not time_60s or now - time_60s >= 60:
             price_60s = price
             time_60s = now
 
-    def on_error(ws, error):
-        print(f"[{symbol}] خطأ:", error)
-
     def on_close(ws):
-        print(f"[{symbol}] تم الإغلاق - إعادة التشغيل...")
         time.sleep(2)
         threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
 
-    ws = WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
+    def on_error(ws, error):
+        print(f"[{symbol}] خطأ:", error)
+
+    ws = WebSocketApp(url, on_message=on_message, on_close=on_close, on_error=on_error)
     ws.run_forever()
 
 def watcher_loop():
@@ -165,7 +159,7 @@ def watcher_loop():
         if r.get(IS_RUNNING_KEY) != b"1":
             time.sleep(5)
             continue
-        coins = r.smembers("coins")
+        coins = r.hkeys("watchlist")
         symbols = {c.decode() for c in coins}
         for sym in symbols - watched:
             threading.Thread(target=watch_price, args=(sym,), daemon=True).start()
@@ -185,17 +179,13 @@ def telegram_webhook():
     if text == "play":
         r.set(IS_RUNNING_KEY, "1")
         send_message("✅ بدأ التشغيل Sniper.")
-        coins = r.smembers("coins")
-        coin_list = [c.decode().replace("USDT", "") for c in coins]
-        if coin_list:
-            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {m}" for m in coin_list]))
     elif text == "stop":
         r.set(IS_RUNNING_KEY, "0")
         send_message("🛑 تم إيقاف Sniper مؤقتًا.")
     elif text == "السجل":
-        coins = r.smembers("coins")
-        coin_list = [c.decode().replace("USDT", "") for c in coins]
-        if coin_list:
+        coins = r.hkeys("watchlist")
+        if coins:
+            coin_list = [c.decode().replace("USDT", "") for c in coins]
             send_message("📡 العملات المرصودة:\n" + "\n".join(coin_list))
         else:
             send_message("🚫 لا توجد عملات قيد المراقبة حالياً.")
