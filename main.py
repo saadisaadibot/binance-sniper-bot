@@ -187,20 +187,34 @@ def telegram_webhook():
     data = request.get_json()
     if not data or "message" not in data:
         return jsonify(success=True)
+
     text = data["message"].get("text", "").strip().lower()
+
     if text == "play":
         r.set(IS_RUNNING_KEY, "1")
         send_message("✅ بدأ التشغيل Sniper.")
+
     elif text == "stop":
         r.set(IS_RUNNING_KEY, "0")
         send_message("🛑 تم إيقاف Sniper مؤقتًا.")
+
     elif text == "السجل":
         coins = r.hkeys("watchlist")
         if coins:
             coin_list = [c.decode().replace("USDT", "") for c in coins]
-            send_message("📡 العملات المرصودة:\n" + "\n".join(coin_list))
+            formatted = ""
+            for i, sym in enumerate(coin_list, 1):
+                formatted += f"{i}. {sym}   "
+                if i % 5 == 0:
+                    formatted += "\n"
+            send_message("📡 العملات المرصودة:\n" + formatted.strip())
         else:
             send_message("🚫 لا توجد عملات قيد المراقبة حالياً.")
+
+    elif text == "reset":
+        r.delete("watchlist")
+        send_message("🧹 تم مسح الذاكرة. سيبدأ المراقبة من جديد بعد الدورة القادمة.")
+
     return jsonify(ok=True)
 
 if __name__ == "__main__":
