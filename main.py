@@ -104,7 +104,7 @@ def update_symbols_loop():
                     count_added += 1
 
             symbols = [s.replace("USDT", "") for s in top_symbols]
-            send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {s}" for s in symbols]))
+            # send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {s}" for s in symbols]))
         else:
             send_message("🚫 لا توجد عملات قابلة للمراقبة حالياً.")
 
