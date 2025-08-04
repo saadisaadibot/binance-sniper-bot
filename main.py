@@ -29,9 +29,11 @@ def get_bitvavo_symbols():
     try:
         res = requests.get("https://api.bitvavo.com/v2/markets")
         data = res.json()
-        return set(m["market"].split("-")[0].upper() for m in data)
+        return set(m["market"].split("-")[0].upper() for m in data if m["market"].endswith("-EUR"))
     except:
         return set()
+
+BITVAVO_SYMBOLS = get_bitvavo_symbols()
 
 # 🧠 ترندات Google
 def get_google_trends():
@@ -55,12 +57,10 @@ def get_coingecko_trends():
 
 # 🔁 جلب الترندات كل دقيقة
 def update_trends_loop():
-    allowed = get_bitvavo_symbols()
-
     while True:
         try:
             trends = set(get_coingecko_trends() + get_google_trends())
-            filtered = [symbol for symbol in trends if symbol in allowed]
+            filtered = [symbol for symbol in trends if symbol in BITVAVO_SYMBOLS]
             new_coins = []
 
             for symbol in filtered:
@@ -151,10 +151,8 @@ def telegram_webhook():
         send_message(msg)
     elif text == "انسى كل شي":
         r.delete("watched_trend_coins")
-
         for key in r.scan_iter(f"{WATCH_KEY}:*"):
             r.delete(key)
-
         send_message("🧹 تم حذف كل العملات من Redis وقائمة المراقبة.")
 
     return jsonify(ok=True)
