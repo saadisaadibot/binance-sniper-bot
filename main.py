@@ -125,10 +125,14 @@ def cleanup_old_coins():
 def notify_buy(coin, tag):
     msg = f"🚀 انفجار {tag}: {coin} #{tag}"
     send_message(msg)
+
     try:
-        requests.post(SAQAR_WEBHOOK, json={"message": {"text": f"اشتري {coin}"}})
-    except:
-        pass
+        payload = {"message": {"text": f"اشتري {coin}"}}
+        resp = requests.post(SAQAR_WEBHOOK, json=payload)
+        print(f"🛰️ إرسال إلى صقر: {payload}")
+        print(f"🔁 رد صقر: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        print("❌ فشل الإرسال إلى صقر:", e)
 
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
