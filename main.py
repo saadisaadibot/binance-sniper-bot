@@ -123,6 +123,15 @@ def cleanup_old_coins():
             continue
 
 def notify_buy(coin, tag):
+    key = f"buy_alert:{coin}:{tag}"
+    last_time = r.get(key)
+
+    if last_time and time.time() - float(last_time) < 30:
+        print(f"⛔ تجاهل الإشعار المكرر لـ {coin} #{tag}")
+        return
+
+    r.set(key, time.time())
+
     msg = f"🚀 انفجار {tag}: {coin} #{tag}"
     send_message(msg)
 
