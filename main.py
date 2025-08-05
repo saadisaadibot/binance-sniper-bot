@@ -166,11 +166,11 @@ def watch_price(symbol):
         now = time.time()
         coin = symbol.replace("USDT", "")
 
-        if price_5s and now - time_5s <= 5 and (price - price_5s) / price_5s * 100 >= 1.6:
+        if price_5s and now - time_5s <= 5 and (price - price_5s) / price_5s * 100 >= 1.4:
             notify_buy(coin, "5")
-        if price_10s and now - time_10s <= 10 and (price - price_10s) / price_10s * 100 >= 2:
+        if price_10s and now - time_10s <= 10 and (price - price_10s) / price_10s * 100 >= 1.8:
             notify_buy(coin, "10")
-        if price_120s and now - time_120s <= 120 and (price - price_120s) / price_120s * 100 >= 3:
+        if price_120s and now - time_120s <= 120 and (price - price_120s) / price_120s * 100 >= 2.6:
             notify_buy(coin, "120")
 
         if not time_5s or now - time_5s >= 5:
