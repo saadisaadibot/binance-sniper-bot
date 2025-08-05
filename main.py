@@ -58,8 +58,9 @@ def fetch_binance_top_matched():
             if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
         ]
 
-        matched = [sym for sym in binance_usdt_pairs if sym.replace("USDT", "") in bitvavo_symbols]
-        matched = matched[:100]  # نراقب فقط أول 100 عملة لتقليل الضغط
+        # ✅ تعديل المطابقة ليتوافق مع Bitvavo بغض النظر عن الحروف
+        matched = [sym for sym in binance_usdt_pairs if sym.replace("USDT", "").upper() in bitvavo_symbols]
+        matched = matched[:100]
 
         all_changes = {}
 
@@ -75,12 +76,11 @@ def fetch_binance_top_matched():
             for sym, change in sorted_changes[:count]:
                 all_changes[sym] = change
 
-        # ⏱️ جمع من كل فريم
-        collect_top("15m", 10)
-        collect_top("10m", 10)
-        collect_top("5m", 10)
+        # ✅ رفع عدد العملات المختارة من كل فريم لـ 25 بدل 10
+        collect_top("15m", 20)
+        collect_top("10m", 20)
+        collect_top("5m", 20)
 
-        # 🔄 نرتبهم حسب التغير النهائي بعد الدمج
         sorted_all = sorted(all_changes.items(), key=lambda x: x[1], reverse=True)
         return [s[0] for s in sorted_all]
     except Exception as e:
@@ -102,22 +102,18 @@ def update_symbols_loop():
                 if not r.hexists("watchlist", sym):
                     r.hset("watchlist", sym, now)
                     count_added += 1
-
-            symbols = [s.replace("USDT", "") for s in top_symbols]
-            # send_message("📡 العملات المرصودة:\n" + " ".join([f"سجل {s}" for s in symbols]))
         else:
             send_message("🚫 لا توجد عملات قابلة للمراقبة حالياً.")
 
-        # 🧹 حذف العملات التي انتهت مدة مراقبتها
         cleanup_old_coins()
-        time.sleep(180)  # كل 3 دقائق
+        time.sleep(180)
 
 def cleanup_old_coins():
     now = time.time()
     for sym, ts in r.hgetall("watchlist").items():
         try:
             t = float(ts.decode())
-            if now - t > 2400:  # 30 دقيقة
+            if now - t > 2400:
                 r.hdel("watchlist", sym.decode())
         except:
             continue
@@ -170,7 +166,6 @@ def watch_price(symbol):
         now = time.time()
         coin = symbol.replace("USDT", "")
 
-        # 💥 إشارات الانفجار
         if price_5s and now - time_5s <= 5 and (price - price_5s) / price_5s * 100 >= 1.6:
             notify_buy(coin, "5")
         if price_10s and now - time_10s <= 10 and (price - price_10s) / price_10s * 100 >= 2:
@@ -178,7 +173,6 @@ def watch_price(symbol):
         if price_120s and now - time_120s <= 120 and (price - price_120s) / price_120s * 100 >= 3:
             notify_buy(coin, "120")
 
-        # 🕒 تحديث الأسعار المرجعية
         if not time_5s or now - time_5s >= 5:
             price_5s = price
             time_5s = now
