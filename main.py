@@ -118,7 +118,7 @@ def cleanup_old_coins():
         except:
             continue
 
-def notify_buy(coin, tag):
+def notify_buy(coin, tag, change=None):
     key = f"buy_alert:{coin}:{tag}"
     last_time = r.get(key)
 
@@ -128,7 +128,10 @@ def notify_buy(coin, tag):
 
     r.set(key, time.time())
 
-    msg = f"🚀 انفجار {tag}: {coin} #{tag}"
+    msg = f"🚀 انفجار {tag}"
+    if change:
+        msg += f" (+{change})"
+    msg += f": {coin} #{tag}"
     send_message(msg)
 
     try:
@@ -138,43 +141,46 @@ def notify_buy(coin, tag):
         print(f"🔁 رد صقر: {resp.status_code} - {resp.text}")
     except Exception as e:
         print("❌ فشل الإرسال إلى صقر:", e)
-
+        
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
-    price_180s = None
-    time_180s = None
+
+    watch_duration = 180       # عدد الثواني للمراقبة (قابلة للتعديل)
+    required_change = 2.5      # النسبة المطلوبة للإشعار (قابلة للتعديل)
+
+    old_price = None
+    old_time = None
 
     def on_message(ws, message):
-        nonlocal price_180s, time_180s
+        nonlocal old_price, old_time
         if r.get(IS_RUNNING_KEY) != b"1":
             ws.close()
             return
 
         data = json.loads(message)
         if "p" not in data:
-            print(f"[{symbol}] ⚠️ لا يوجد المفتاح 'p' في الرسالة: {data}")
             return
 
         try:
             price = float(data["p"])
-        except Exception as e:
-            print(f"[{symbol}] خطأ في تحويل السعر: {e}")
+        except:
             return
 
         now = time.time()
         coin = symbol.replace("USDT", "")
 
-        # ✅ شرط الانفجار خلال 180 ثانية
-        if price_180s and now - time_180s <= 180:
-            change = ((price - price_180s) / price_180s) * 100
-            if change >= 2.5:
-                notify_buy(coin, "180")
+        # 💥 شرط التغير الديناميكي
+        if old_price and now - old_time <= watch_duration:
+            change = ((price - old_price) / old_price) * 100
+            if change >= required_change:
+                change_str = f"{change:.2f}%"
+                notify_buy(coin, f"{watch_duration}s", change_str)
 
-        # ✅ تحديث السعر كل 180 ثانية
-        if not time_180s or now - time_180s >= 180:
-            price_180s = price
-            time_180s = now
+        # ⏱ تحديث السعر القديم
+        if not old_time or now - old_time >= watch_duration:
+            old_price = price
+            old_time = now
 
     def on_close(ws):
         time.sleep(2)
