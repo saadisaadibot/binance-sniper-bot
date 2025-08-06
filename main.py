@@ -78,9 +78,9 @@ def fetch_binance_top_matched():
                 all_changes[sym] = change
 
         # ✅ رفع عدد العملات المختارة من كل فريم لـ 25 بدل 10
-        collect_top("15m", 50)
-        collect_top("10m", 20)
-        collect_top("5m", 20)
+        collect_top("15m", 10)
+        collect_top("10m", 10)
+        collect_top("5m", 60)
 
         sorted_all = sorted(all_changes.items(), key=lambda x: x[1], reverse=True)
         return [s[0] for s in sorted_all]
