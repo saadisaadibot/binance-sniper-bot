@@ -123,7 +123,7 @@ def notify_buy(coin, tag, change=None):
     key = f"buy_alert:{coin}:{tag}"
     last_time = r.get(key)
 
-    if last_time and time.time() - float(last_time) < 30:
+    if last_time and time.time() - float(last_time) < 240:
         print(f"⛔ تجاهل الإشعار المكرر لـ {coin} #{tag}")
         return
 
