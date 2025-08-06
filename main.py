@@ -142,6 +142,8 @@ def notify_buy(coin, tag, change=None):
     except Exception as e:
         print("❌ فشل الإرسال إلى صقر:", e)
         
+from collections import deque
+
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
@@ -149,11 +151,9 @@ def watch_price(symbol):
     watch_duration = 180       # عدد الثواني للمراقبة (قابلة للتعديل)
     required_change = 2.5      # النسبة المطلوبة للإشعار (قابلة للتعديل)
 
-    old_price = None
-    old_time = None
+    price_history = deque()  # 🧠 قائمة لحفظ الأسعار مع الزمن
 
     def on_message(ws, message):
-        nonlocal old_price, old_time
         if r.get(IS_RUNNING_KEY) != b"1":
             ws.close()
             return
@@ -170,17 +170,20 @@ def watch_price(symbol):
         now = time.time()
         coin = symbol.replace("USDT", "")
 
-        # 💥 شرط التغير الديناميكي
-        if old_price and now - old_time <= watch_duration:
-            change = ((price - old_price) / old_price) * 100
+        # 🕓 أضف السعر الحالي مع التوقيت إلى القائمة
+        price_history.append((now, price))
+
+        # 🧹 حذف الأسعار الأقدم من مدة المراقبة
+        while price_history and now - price_history[0][0] > watch_duration:
+            price_history.popleft()
+
+        # ✅ شرط الانفجار مقارنةً بأقل سعر خلال آخر 3 دقائق
+        if len(price_history) > 1:
+            min_price = min(p[1] for p in price_history)
+            change = ((price - min_price) / min_price) * 100
             if change >= required_change:
                 change_str = f"{change:.2f}%"
                 notify_buy(coin, f"{watch_duration}s", change_str)
-
-        # ⏱ تحديث السعر القديم
-        if not old_time or now - old_time >= watch_duration:
-            old_price = price
-            old_time = now
 
     def on_close(ws):
         time.sleep(2)
