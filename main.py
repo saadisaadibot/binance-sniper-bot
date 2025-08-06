@@ -7,6 +7,7 @@ import requests
 from flask import Flask, request, jsonify
 from websocket import WebSocketApp
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
@@ -141,8 +142,6 @@ def notify_buy(coin, tag, change=None):
         print(f"🔁 رد صقر: {resp.status_code} - {resp.text}")
     except Exception as e:
         print("❌ فشل الإرسال إلى صقر:", e)
-        
-from collections import deque
 
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
