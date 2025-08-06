@@ -28,15 +28,21 @@ def send_message(text):
 # 🧠 حساب التغير من شموع Bitvavo
 def get_candle_change(market, interval):
     try:
-        url = f"https://api.bitvavo.com/v2/market/{market}/candles?interval={interval}&limit=2"
-        res = requests.get(url, timeout=3).json()
-        if len(res) < 2:
+        url = f"https://api.bitvavo.com/v2/{market}/candles?interval={interval}&limit=2"
+        res = requests.get(url, timeout=3)
+        data = res.json()
+
+        if not isinstance(data, list) or len(data) < 2:
+            print(f"⚠️ لا توجد شموع كافية لـ {market} ({interval}) - المحتوى:", data)
             return None
-        open_price = float(res[-2][1])
-        close_price = float(res[-2][4])
+
+        open_price = float(data[-2][1])  # شمعة مكتملة
+        close_price = float(data[-2][4])
         change = ((close_price - open_price) / open_price) * 100
         return change
-    except:
+
+    except Exception as e:
+        print(f"❌ خطأ في get_candle_change لـ {market}: {e}")
         return None
 
 # 🎯 اختيار العملات القوية من Bitvavo ومطابقتها مع Binance
