@@ -142,17 +142,16 @@ def notify_buy(coin, tag):
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
-    price_5s = price_10s = price_120s = None
-    time_5s = time_10s = time_120s = None
+    price_180s = None
+    time_180s = None
 
     def on_message(ws, message):
-        nonlocal price_5s, time_5s, price_10s, time_10s, price_120s, time_120s
+        nonlocal price_180s, time_180s
         if r.get(IS_RUNNING_KEY) != b"1":
             ws.close()
             return
 
         data = json.loads(message)
-
         if "p" not in data:
             print(f"[{symbol}] ⚠️ لا يوجد المفتاح 'p' في الرسالة: {data}")
             return
@@ -166,22 +165,16 @@ def watch_price(symbol):
         now = time.time()
         coin = symbol.replace("USDT", "")
 
-        if price_5s and now - time_5s <= 5 and (price - price_5s) / price_5s * 100 >= 1.8:
-            notify_buy(coin, "5")
-        if price_10s and now - time_10s <= 10 and (price - price_10s) / price_10s * 100 >= 2.1:
-            notify_buy(coin, "10")
-        if price_120s and now - time_120s <= 120 and (price - price_120s) / price_120s * 100 >= 2.6:
-            notify_buy(coin, "120")
+        # ✅ شرط الانفجار خلال 180 ثانية
+        if price_180s and now - time_180s <= 180:
+            change = ((price - price_180s) / price_180s) * 100
+            if change >= 2.5:
+                notify_buy(coin, "180")
 
-        if not time_5s or now - time_5s >= 5:
-            price_5s = price
-            time_5s = now
-        if not time_10s or now - time_10s >= 10:
-            price_10s = price
-            time_10s = now
-        if not time_120s or now - time_120s >= 120:
-            price_120s = price
-            time_120s = now
+        # ✅ تحديث السعر كل 180 ثانية
+        if not time_180s or now - time_180s >= 180:
+            price_180s = price
+            time_180s = now
 
     def on_close(ws):
         time.sleep(2)
