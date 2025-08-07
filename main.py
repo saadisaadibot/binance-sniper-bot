@@ -9,12 +9,20 @@ from websocket import WebSocketApp
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 
-app = Flask(__name__)
-r = redis.from_url(os.getenv("REDIS_URL"))
+# 🔧 الإعدادات القابلة للتعديل
+MAX_TOP_COINS = 15        # عدد العملات المختارة من Bitvavo في كل دورة
+WATCH_DURATION = 180      # مدة مراقبة السعر بالثواني
+REQUIRED_CHANGE = 0.2     # نسبة الانفجار السعري المطلوبة (%)
+RANK_FILTER = 10          # إرسال الإشعارات فقط للعملات ضمن Top {X}
+SYMBOL_UPDATE_INTERVAL = 180  # الزمن بين كل دورة لجمع العملات (ثانية)
+REDIS_URL = os.getenv("REDIS_URL")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-IS_RUNNING_KEY = "sniper_running"
 SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/"
+IS_RUNNING_KEY = "sniper_running"
+
+app = Flask(__name__)
+r = redis.from_url(REDIS_URL)
 
 def send_message(text):
     try:
@@ -29,27 +37,21 @@ def get_candle_change(market, interval):
         res = requests.get(url, timeout=3)
         data = res.json()
         if not isinstance(data, list) or len(data) < 2:
-            print(f"⚠️ لا توجد شموع كافية لـ {market} ({interval}) - المحتوى:", data)
             return None
         open_price = float(data[-2][1])
         close_price = float(data[-2][4])
-        change = ((close_price - open_price) / open_price) * 100
-        return change
+        return ((close_price - open_price) / open_price) * 100
     except Exception as e:
         print(f"❌ خطأ في get_candle_change لـ {market}: {e}")
         return None
 
-# 🔍 اختيار العملات من Bitvavo ومطابقتها مع Binance
-# في دالة fetch_top_bitvavo_then_match_binance():
 def fetch_top_bitvavo_then_match_binance():
     try:
-        r.delete("not_found_binance")  # 🧹 حذف القائمة القديمة
-
+        r.delete("not_found_binance")
         markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
         markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
 
         changes_5m = []
-
         def process(market):
             symbol = market.replace("-EUR", "").upper()
             ch5 = get_candle_change(market, "5m")
@@ -61,34 +63,25 @@ def fetch_top_bitvavo_then_match_binance():
                 if ch5 is not None:
                     changes_5m.append((sym, ch5))
 
-        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:15]
-        combined = list({s for s, _ in top5})
+        top_symbols = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:MAX_TOP_COINS]
+        combined = list({s for s, _ in top_symbols})
         print(f"📊 العملات المختارة من Bitvavo (5m): {len(combined)} → {combined}")
 
         exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
         binance_pairs = {s["symbol"] for s in exchange_info["symbols"] if s["status"] == "TRADING"}
-
-        # 🧠 خريطة BASE → SYMBOL
         symbol_map = {s["baseAsset"].upper(): s["symbol"] for s in exchange_info["symbols"] if s["status"] == "TRADING"}
 
         matched, not_found = [], []
-
         for coin in combined:
             coin_upper = coin.upper()
-
-            # ✅ مستوى 1: تطابق الاسم الأساسي
             if coin_upper in symbol_map:
                 matched.append(symbol_map[coin_upper])
-                continue
-
-            # ✅ مستوى 2: تطابق في الرمز الكامل
-            possible_matches = [s for s in binance_pairs if s.startswith(coin_upper)]
-            if possible_matches:
-                matched.append(possible_matches[0])
-                continue
-
-            # ❌ لم يتم العثور عليها
-            not_found.append(coin)
+            else:
+                possible_matches = [s for s in binance_pairs if s.startswith(coin_upper)]
+                if possible_matches:
+                    matched.append(possible_matches[0])
+                else:
+                    not_found.append(coin)
 
         if not_found:
             send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(not_found))
@@ -108,19 +101,18 @@ def update_symbols_loop():
 
         print("🌀 بدء دورة جديدة لجلب العملات...")
         top_symbols = fetch_top_bitvavo_then_match_binance()
-
         if not top_symbols:
-            print("⚠️ لم يتم العثور على عملات قابلة للمراقبة.")
             send_message("⚠️ لم يتم العثور على عملات صالحة في هذه الدورة.")
-            time.sleep(180)
+            time.sleep(SYMBOL_UPDATE_INTERVAL)
             continue
 
         now = time.time()
         for sym in top_symbols:
             r.hset("watchlist", sym, now)
+
         print(f"📡 تم تحديث {len(top_symbols)} عملة في المراقبة.")
         cleanup_old_coins()
-        time.sleep(180)
+        time.sleep(SYMBOL_UPDATE_INTERVAL)
 
 def cleanup_old_coins():
     now = time.time()
@@ -148,7 +140,6 @@ def get_rank_from_bitvavo(coin_symbol):
         for i, (symbol, _) in enumerate(sorted_changes, 1):
             if symbol == coin_symbol.upper():
                 return i
-
         return None
     except Exception as e:
         print(f"⚠️ خطأ في get_rank_from_bitvavo: {e}")
@@ -163,17 +154,11 @@ def notify_buy(coin, tag, change=None):
     r.set(key, time.time())
 
     rank = get_rank_from_bitvavo(coin)
-
-    # ✅ فلترة: فقط توب 10
-    if not rank or rank > 10:
-        print(f"⛔ تجاهل الإشعار لأن {coin} ترتيبها خارج التوب 10 أو غير معروف: #{rank}")
+    if not rank or rank > RANK_FILTER:
+        print(f"⛔ تجاهل الإشعار لأن {coin} ترتيبها خارج التوب {RANK_FILTER} أو غير معروف.")
         return
 
-    if change:
-        msg = f"🚀 {coin} انفجرت بـ {change}  #top{rank}"
-    else:
-        msg = f"🚀 انفجار {tag}: {coin} #top{rank}"
-
+    msg = f"🚀 {coin} انفجرت بـ {change}  #top{rank}" if change else f"🚀 انفجار {tag}: {coin} #top{rank}"
     send_message(msg)
 
     try:
@@ -187,14 +172,13 @@ def notify_buy(coin, tag, change=None):
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
-    watch_duration = 180
-    required_change = 0.2
     price_history = deque()
 
     def on_message(ws, message):
         if r.get(IS_RUNNING_KEY) != b"1":
             ws.close()
             return
+
         data = json.loads(message)
         if "p" not in data:
             return
@@ -202,21 +186,24 @@ def watch_price(symbol):
             price = float(data["p"])
         except:
             return
+
         now = time.time()
         coin = symbol.replace("USDT", "").replace("BTC", "").replace("EUR", "")
         price_history.append((now, price))
-        while price_history and now - price_history[0][0] > watch_duration:
+        while price_history and now - price_history[0][0] > WATCH_DURATION:
             price_history.popleft()
+
         if len(price_history) > 1:
             min_price = min(p[1] for p in price_history)
             change = ((price - min_price) / min_price) * 100
-            if change >= required_change:
+            if change >= REQUIRED_CHANGE:
                 duration = int(now - price_history[0][0])
                 change_str = f"{change:.2f}% خلال {duration} ثانية"
-                notify_buy(coin, f"{watch_duration}s", change_str)
+                notify_buy(coin, f"{WATCH_DURATION}s", change_str)
 
     def on_close(ws): time.sleep(2); threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
     def on_error(ws, error): print(f"[{symbol}] خطأ:", error)
+
     ws = WebSocketApp(url, on_message=on_message, on_close=on_close, on_error=on_error)
     ws.run_forever()
 
@@ -226,6 +213,7 @@ def watcher_loop():
         if r.get(IS_RUNNING_KEY) != b"1":
             time.sleep(5)
             continue
+
         coins = r.hkeys("watchlist")
         symbols = {c.decode() for c in coins}
         for sym in symbols - watched:
@@ -234,7 +222,8 @@ def watcher_loop():
         time.sleep(1)
 
 @app.route("/")
-def home(): return "🔥 Sniper Mode is Live", 200
+def home():
+    return "🔥 Sniper Mode is Live", 200
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -271,6 +260,7 @@ def telegram_webhook():
     elif text == "reset":
         r.delete("watchlist")
         send_message("🧹 تم مسح الذاكرة. سيبدأ المراقبة من جديد بعد الدورة القادمة.")
+
     return jsonify(ok=True)
 
 if __name__ == "__main__":
