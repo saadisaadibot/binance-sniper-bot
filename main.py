@@ -16,7 +16,6 @@ CHAT_ID = os.getenv("CHAT_ID")
 IS_RUNNING_KEY = "sniper_running"
 SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/"
 
-# 📨 إرسال رسالة إلى تليجرام
 def send_message(text):
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -24,7 +23,6 @@ def send_message(text):
     except Exception as e:
         print("فشل إرسال الرسالة:", e)
 
-# 📉 جلب نسبة التغير من شموع Bitvavo
 def get_candle_change(market, interval):
     try:
         url = f"https://api.bitvavo.com/v2/{market}/candles?interval={interval}&limit=2"
@@ -41,7 +39,6 @@ def get_candle_change(market, interval):
         print(f"❌ خطأ في get_candle_change لـ {market}: {e}")
         return None
 
-# 🔍 اختيار العملات من Bitvavo ومطابقتها مع Binance
 def fetch_top_bitvavo_then_match_binance():
     try:
         markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
@@ -56,7 +53,7 @@ def fetch_top_bitvavo_then_match_binance():
             ch5 = get_candle_change(market, "5m")
             return (symbol, ch15, ch10, ch5)
 
-        with ThreadPoolExecutor(max_workers=20) as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             results = executor.map(process, markets)
             for sym, ch15, ch10, ch5 in results:
                 if ch15 is not None:
@@ -97,7 +94,6 @@ def fetch_top_bitvavo_then_match_binance():
         print("❌ خطأ في fetch_top_bitvavo_then_match_binance:", e)
         return []
 
-# ♻️ تحديث العملات المراقبة
 def update_symbols_loop():
     while True:
         if r.get(IS_RUNNING_KEY) != b"1":
@@ -114,19 +110,12 @@ def update_symbols_loop():
             continue
 
         now = time.time()
-        current_symbols = set(r.hkeys("watchlist"))
-        count_added = 0
-
         for sym in top_symbols:
-            if sym.encode() not in current_symbols:
-                r.hset("watchlist", sym, now)
-                count_added += 1
-
-        print(f"📡 تمت إضافة {count_added} عملة جديدة للمراقبة.")
+            r.hset("watchlist", sym, now)
+        print(f"📡 تم تحديث {len(top_symbols)} عملة في المراقبة.")
         cleanup_old_coins()
         time.sleep(180)
 
-# 🧹 حذف العملات القديمة
 def cleanup_old_coins():
     now = time.time()
     for sym, ts in r.hgetall("watchlist").items():
@@ -137,7 +126,6 @@ def cleanup_old_coins():
         except:
             continue
 
-# 💥 إشعار بالشراء
 def notify_buy(coin, tag, change=None):
     key = f"buy_alert:{coin}:{tag}"
     last_time = r.get(key)
@@ -161,12 +149,11 @@ def notify_buy(coin, tag, change=None):
     except Exception as e:
         print("❌ فشل الإرسال إلى صقر:", e)
 
-# 📈 مراقبة السعر
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
-    watch_duration = 240
-    required_change = 2.6
+    watch_duration = 180
+    required_change = 1.8
     price_history = deque()
 
     def on_message(ws, message):
@@ -198,7 +185,6 @@ def watch_price(symbol):
     ws = WebSocketApp(url, on_message=on_message, on_close=on_close, on_error=on_error)
     ws.run_forever()
 
-# 👀 تشغيل المراقبة
 def watcher_loop():
     watched = set()
     while True:
@@ -212,7 +198,6 @@ def watcher_loop():
             watched.add(sym)
         time.sleep(1)
 
-# 🌐 مسارات Flask
 @app.route("/")
 def home(): return "🔥 Sniper Mode is Live", 200
 
@@ -246,7 +231,6 @@ def telegram_webhook():
         send_message("🧹 تم مسح الذاكرة. سيبدأ المراقبة من جديد بعد الدورة القادمة.")
     return jsonify(ok=True)
 
-# 🧠 التشغيل الفعلي
 if __name__ == "__main__":
     r.set(IS_RUNNING_KEY, "1")
     threading.Thread(target=update_symbols_loop, daemon=True).start()
