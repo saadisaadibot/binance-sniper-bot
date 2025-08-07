@@ -12,14 +12,14 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "https://saadisaadibot-saqarxbo-production.up.railway.app/")
-HISTORY_SECONDS = 1800  # 30 دقيقة
-ALERT_EXPIRE = 60       # لا تكرار إشعارات للعملة خلال دقيقة
+HISTORY_SECONDS = 1800
+ALERT_EXPIRE = 60
 
 def send_message(text):
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": text})
     except Exception as e:
-        print("فشل إرسال الرسالة:", e)
+        print("❌ فشل إرسال الرسالة:", e)
 
 def fetch_symbols():
     try:
@@ -34,7 +34,7 @@ def fetch_prices():
         res = requests.get("https://api.bitvavo.com/v2/ticker/price")
         return {item["market"]: float(item["price"]) for item in res.json() if item["market"].endswith("-EUR")}
     except Exception as e:
-        print("فشل جلب الأسعار:", e)
+        print("❌ فشل جلب الأسعار:", e)
         return {}
 
 def store_price(symbol, price):
@@ -62,7 +62,7 @@ def alert(symbol, tag, percent):
     try:
         requests.post(SAQAR_WEBHOOK, json={"text": f"اشتري {symbol}"})
     except Exception as e:
-        print("فشل الإرسال إلى صقر:", e)
+        print("❌ فشل الإرسال إلى صقر:", e)
 
 def analyze_symbol(symbol):
     current = get_old_price(symbol, 0)
@@ -86,23 +86,30 @@ def analyze_symbol(symbol):
 
 def store_loop():
     while True:
-        prices = fetch_prices()
-        for market, price in prices.items():
-            symbol = market.replace("-EUR", "")
-            store_price(symbol, price)
-        print("✅ تم تخزين الأسعار:", datetime.now().strftime("%H:%M:%S"))
+        try:
+            prices = fetch_prices()
+            for market, price in prices.items():
+                symbol = market.replace("-EUR", "")
+                store_price(symbol, price)
+            print("✅ تم تخزين الأسعار:", datetime.now().strftime("%H:%M:%S"))
+        except Exception as e:
+            print("❌ خطأ في store_loop:", e)
         time.sleep(5)
 
 def analyze_loop():
     while True:
-        symbols = fetch_symbols()
-        for symbol in symbols:
-            threading.Thread(target=analyze_symbol, args=(symbol,), daemon=True).start()
+        try:
+            symbols = fetch_symbols()
+            for symbol in symbols:
+                threading.Thread(target=analyze_symbol, args=(symbol,)).start()
+            print("🔍 تم تحليل الأسعار:", datetime.now().strftime("%H:%M:%S"))
+        except Exception as e:
+            print("❌ خطأ في analyze_loop:", e)
         time.sleep(30)
 
 @app.route("/")
 def home():
-    return "صياد الصيادين جاهز ✅"
+    return "صياد الصيادين شغال ✅"
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -148,3 +155,7 @@ def get_summary():
 
     send_message(text)
     return {"ok": True}
+
+# ✅ شغل كل الخيوط عند تشغيل السكربت
+threading.Thread(target=store_loop).start()
+threading.Thread(target=analyze_loop).start()
