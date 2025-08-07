@@ -97,7 +97,7 @@ def analyze_loop():
     while True:
         symbols = fetch_symbols()
         for symbol in symbols:
-            threading.Thread(target=analyze_symbol, args=(symbol,)).start()
+            threading.Thread(target=analyze_symbol, args=(symbol,), daemon=True).start()
         time.sleep(30)
 
 @app.route("/")
@@ -148,10 +148,3 @@ def get_summary():
 
     send_message(text)
     return {"ok": True}
-
-if __name__ == "__main__":
-    t1 = threading.Thread(target=store_loop)
-    t2 = threading.Thread(target=analyze_loop)
-    t1.start()
-    t2.start()
-    app.run(host="0.0.0.0", port=5000)
