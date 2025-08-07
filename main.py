@@ -61,7 +61,7 @@ def fetch_top_bitvavo_then_match_binance():
                 if ch5 is not None:
                     changes_5m.append((sym, ch5))
 
-        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:10]
+        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:15]
         combined = list({s for s, _ in top5})
         print(f"📊 العملات المختارة من Bitvavo (5m): {len(combined)} → {combined}")
 
@@ -189,7 +189,7 @@ def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
     watch_duration = 180
-    required_change = 2.6
+    required_change = 0.2
     price_history = deque()
 
     def on_message(ws, message):
