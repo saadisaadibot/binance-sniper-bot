@@ -61,7 +61,7 @@ def fetch_top_bitvavo_then_match_binance():
                 if ch5 is not None:
                     changes_5m.append((sym, ch5))
 
-        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:15]
+        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:10]
         combined = list({s for s, _ in top5})
         print(f"📊 العملات المختارة من Bitvavo (5m): {len(combined)} → {combined}")
 
