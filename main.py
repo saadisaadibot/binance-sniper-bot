@@ -150,7 +150,7 @@ def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
     watch_duration = 180
-    required_change = 1.8
+    required_change = 2.6
     price_history = deque()
 
     def on_message(ws, message):
