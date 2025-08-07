@@ -106,13 +106,17 @@ def home():
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
-    data = request.json
-    if "message" not in data:
-        return "", 200
-    text = data["message"].get("text", "")
-    if "السجل" in text:
-        return jsonify(get_summary()), 200
-    return "", 200
+    try:
+        data = request.json
+        if "message" not in data:
+            return jsonify({"ok": False}), 200
+        text = data["message"].get("text", "")
+        if "السجل" in text:
+            return jsonify(get_summary()), 200
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        print("❌ webhook crashed:", e)
+        return jsonify({"ok": False}), 200
 
 def get_summary():
     now = int(time.time())
