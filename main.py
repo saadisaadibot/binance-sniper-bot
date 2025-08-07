@@ -39,10 +39,10 @@ def get_candle_change(market, interval):
         print(f"❌ خطأ في get_candle_change لـ {market}: {e}")
         return None
 
-# 🔍 اختيار العملات من Bitvavo ومطابقتها مع Binance
-# في دالة fetch_top_bitvavo_then_match_binance():
-def fetch_top_bitvavo_then_match_binance():
+# 🔍 اختيار العملات من Bitvavo ومطابقتها مع def fetch_top_bitvavo_then_match_binance():
     try:
+        r.delete("not_found_binance")  # 🧹 حذف القائمة القديمة
+
         markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
         markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
 
@@ -66,24 +66,37 @@ def fetch_top_bitvavo_then_match_binance():
         exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
         binance_pairs = {s["symbol"] for s in exchange_info["symbols"] if s["status"] == "TRADING"}
 
+        # 🧠 خريطة BASE → SYMBOL
+        symbol_map = {s["baseAsset"].upper(): s["symbol"] for s in exchange_info["symbols"] if s["status"] == "TRADING"}
+
         matched, not_found = [], []
 
         for coin in combined:
-            found = False
-            for quote in ["USDT", "BTC", "EUR"]:
-                pair = f"{coin}{quote}"
-                if pair in binance_pairs:
-                    matched.append(pair)
-                    found = True
-                    break
-            if not found:
-                not_found.append(coin)
+            coin_upper = coin.upper()
+
+            # ✅ مستوى 1: تطابق الاسم الأساسي
+            if coin_upper in symbol_map:
+                matched.append(symbol_map[coin_upper])
+                continue
+
+            # ✅ مستوى 2: تطابق في الرمز الكامل
+            possible_matches = [s for s in binance_pairs if s.startswith(coin_upper)]
+            if possible_matches:
+                matched.append(possible_matches[0])
+                continue
+
+            # ❌ لم يتم العثور عليها
+            not_found.append(coin)
 
         if not_found:
             send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(not_found))
-            r.sadd("not_found_binance", *not_found)  # 🔥 تخزين العملات المفقودة في Redis
+            r.sadd("not_found_binance", *not_found)
 
         return matched
+
+    except Exception as e:
+        print("❌ خطأ في fetch_top_bitvavo_then_match_binance:", e)
+        return []
 
     except Exception as e:
         print("❌ خطأ في fetch_top_bitvavo_then_match_binance:", e)
