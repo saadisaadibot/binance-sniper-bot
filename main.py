@@ -39,34 +39,31 @@ def get_candle_change(market, interval):
         print(f"❌ خطأ في get_candle_change لـ {market}: {e}")
         return None
 
+# 🔍 اختيار العملات من Bitvavo ومطابقتها مع Binance
 def fetch_top_bitvavo_then_match_binance():
     try:
         markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
         markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
 
-        changes_15m, changes_10m, changes_5m = [], [], []
+        changes_1m, changes_5m = [], []
 
         def process(market):
             symbol = market.replace("-EUR", "").upper()
-            ch15 = get_candle_change(market, "15m")
-            ch10 = get_candle_change(market, "10m")
+            ch1 = get_candle_change(market, "1m")
             ch5 = get_candle_change(market, "5m")
-            return (symbol, ch15, ch10, ch5)
+            return (symbol, ch1, ch5)
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=20) as executor:
             results = executor.map(process, markets)
-            for sym, ch15, ch10, ch5 in results:
-                if ch15 is not None:
-                    changes_15m.append((sym, ch15))
-                if ch10 is not None:
-                    changes_10m.append((sym, ch10))
+            for sym, ch1, ch5 in results:
+                if ch1 is not None:
+                    changes_1m.append((sym, ch1))
                 if ch5 is not None:
                     changes_5m.append((sym, ch5))
 
-        top15 = sorted(changes_15m, key=lambda x: x[1], reverse=True)[:5]
-        top10 = sorted(changes_10m, key=lambda x: x[1], reverse=True)[:10]
-        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:15]
-        combined = list({s for s, _ in top15 + top10 + top5})
+        top1 = sorted(changes_1m, key=lambda x: x[1], reverse=True)[:15]
+        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:10]
+        combined = list({s for s, _ in top1 + top5})
         print(f"📊 العملات المختارة من Bitvavo: {len(combined)} → {combined}")
 
         exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
