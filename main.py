@@ -210,12 +210,12 @@ def telegram_webhook():
         r.set(IS_RUNNING_KEY, "0")
         send_message("🛑 تم إيقاف Sniper مؤقتًا.")
     elif text == "العملات المفقودة":
-    coins = r.smembers("not_found_binance")
-    if coins:
-        names = [c.decode() for c in coins]
-        send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(names))
-    else:
-        send_message("✅ لا توجد عملات مفقودة حالياً.")
+        coins = r.smembers("not_found_binance")
+        if coins:
+            names = [c.decode() for c in coins]
+            send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(names))
+        else:
+            send_message("✅ لا توجد عملات مفقودة حالياً.")
     elif text == "السجل":
         coins = r.hkeys("watchlist")
         if coins:
