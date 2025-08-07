@@ -40,31 +40,28 @@ def get_candle_change(market, interval):
         return None
 
 # 🔍 اختيار العملات من Bitvavo ومطابقتها مع Binance
+# في دالة fetch_top_bitvavo_then_match_binance():
 def fetch_top_bitvavo_then_match_binance():
     try:
         markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
         markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
 
-        changes_1m, changes_5m = [], []
+        changes_5m = []
 
         def process(market):
             symbol = market.replace("-EUR", "").upper()
-            ch1 = get_candle_change(market, "1m")
             ch5 = get_candle_change(market, "5m")
-            return (symbol, ch1, ch5)
+            return (symbol, ch5)
 
         with ThreadPoolExecutor(max_workers=20) as executor:
             results = executor.map(process, markets)
-            for sym, ch1, ch5 in results:
-                if ch1 is not None:
-                    changes_1m.append((sym, ch1))
+            for sym, ch5 in results:
                 if ch5 is not None:
                     changes_5m.append((sym, ch5))
 
-        top1 = sorted(changes_1m, key=lambda x: x[1], reverse=True)[:15]
-        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:10]
-        combined = list({s for s, _ in top1 + top5})
-        print(f"📊 العملات المختارة من Bitvavo: {len(combined)} → {combined}")
+        top5 = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:15]
+        combined = list({s for s, _ in top5})
+        print(f"📊 العملات المختارة من Bitvavo (5m): {len(combined)} → {combined}")
 
         exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
         binance_pairs = {s["symbol"] for s in exchange_info["symbols"] if s["status"] == "TRADING"}
@@ -84,6 +81,7 @@ def fetch_top_bitvavo_then_match_binance():
 
         if not_found:
             send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(not_found))
+            r.sadd("not_found_binance", *not_found)  # 🔥 تخزين العملات المفقودة في Redis
 
         return matched
 
@@ -126,7 +124,7 @@ def cleanup_old_coins():
 def notify_buy(coin, tag, change=None):
     key = f"buy_alert:{coin}:{tag}"
     last_time = r.get(key)
-    if last_time and time.time() - float(last_time) < 240:
+    if last_time and time.time() - float(last_time) < 900:
         print(f"⛔ تجاهل الإشعار المكرر لـ {coin} #{tag}")
         return
     r.set(key, time.time())
@@ -211,6 +209,13 @@ def telegram_webhook():
     elif text == "stop":
         r.set(IS_RUNNING_KEY, "0")
         send_message("🛑 تم إيقاف Sniper مؤقتًا.")
+    elif text == "العملات المفقودة":
+    coins = r.smembers("not_found_binance")
+    if coins:
+        names = [c.decode() for c in coins]
+        send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(names))
+    else:
+        send_message("✅ لا توجد عملات مفقودة حالياً.")
     elif text == "السجل":
         coins = r.hkeys("watchlist")
         if coins:
