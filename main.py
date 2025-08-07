@@ -39,7 +39,9 @@ def get_candle_change(market, interval):
         print(f"❌ خطأ في get_candle_change لـ {market}: {e}")
         return None
 
-# 🔍 اختيار العملات من Bitvavo ومطابقتها مع def fetch_top_bitvavo_then_match_binance():
+# 🔍 اختيار العملات من Bitvavo ومطابقتها مع Binance
+# في دالة fetch_top_bitvavo_then_match_binance():
+def fetch_top_bitvavo_then_match_binance():
     try:
         r.delete("not_found_binance")  # 🧹 حذف القائمة القديمة
 
@@ -93,10 +95,6 @@ def get_candle_change(market, interval):
             r.sadd("not_found_binance", *not_found)
 
         return matched
-
-    except Exception as e:
-        print("❌ خطأ في fetch_top_bitvavo_then_match_binance:", e)
-        return []
 
     except Exception as e:
         print("❌ خطأ في fetch_top_bitvavo_then_match_binance:", e)
