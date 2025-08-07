@@ -164,16 +164,15 @@ def notify_buy(coin, tag, change=None):
 
     rank = get_rank_from_bitvavo(coin)
 
+    # ✅ فلترة: فقط توب 10
+    if not rank or rank > 10:
+        print(f"⛔ تجاهل الإشعار لأن {coin} ترتيبها خارج التوب 10 أو غير معروف: #{rank}")
+        return
+
     if change:
-        if rank and rank <= 15:
-            msg = f"🚀 {coin} انفجرت بـ {change}  #top{rank}"
-        else:
-            msg = f"🚀 {coin} انفجرت بـ {change}  #{tag}"
+        msg = f"🚀 {coin} انفجرت بـ {change}  #top{rank}"
     else:
-        if rank and rank <= 15:
-            msg = f"🚀 انفجار {tag}: {coin} #top{rank}"
-        else:
-            msg = f"🚀 انفجار {tag}: {coin} #{tag}"
+        msg = f"🚀 انفجار {tag}: {coin} #top{rank}"
 
     send_message(msg)
 
