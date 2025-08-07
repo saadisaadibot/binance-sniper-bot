@@ -149,7 +149,7 @@ def notify_buy(coin, tag, change=None):
     key = f"buy_alert:{coin}:{tag}"
     last_time = r.get(key)
     if last_time and time.time() - float(last_time) < 900:
-        print(f"⛔ تجاهل الإشعار المكرر لـ {coin} #{tag}")
+        # حذف هذه الطباعة لا يغيّر أي شيء وظيفي
         return
     r.set(key, time.time())
 
