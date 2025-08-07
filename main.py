@@ -11,16 +11,18 @@ app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "https://saadisaadibot-saqarxbo-production.up.railway.app/")
-HISTORY_SECONDS = 1800
-ALERT_EXPIRE = 60
+SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "")
+HISTORY_SECONDS = 1800  # 30 دقيقة
+ALERT_EXPIRE = 60       # لا إشعارات مكررة خلال 60 ثانية
 
+# إرسال رسالة لتلغرام
 def send_message(text):
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": text})
     except Exception as e:
         print("❌ فشل إرسال الرسالة:", e)
 
+# جلب جميع العملات من Bitvavo
 def fetch_symbols():
     try:
         res = requests.get("https://api.bitvavo.com/v2/markets")
@@ -29,133 +31,95 @@ def fetch_symbols():
     except:
         return []
 
+# جلب أسعار العملات
 def fetch_prices():
     try:
         res = requests.get("https://api.bitvavo.com/v2/ticker/price")
-        return {item["market"]: float(item["price"]) for item in res.json() if item["market"].endswith("-EUR")}
-    except Exception as e:
-        print("❌ فشل جلب الأسعار:", e)
+        return {item["market"].replace("-EUR", ""): float(item["price"]) for item in res.json() if item["market"].endswith("-EUR")}
+    except:
         return {}
 
-def store_price(symbol, price):
-    key = f"prices:{symbol}"
-    ts = int(time.time())
-    r.zadd(key, {price: ts})
-    r.zremrangebyscore(key, 0, ts - HISTORY_SECONDS)
+# تخزين السعر الحالي في Redis
+def store_prices(prices):
+    now = time.time()
+    for symbol, price in prices.items():
+        key = f"prices:{symbol}"
+        r.zadd(key, {price: now})
+        r.zremrangebyscore(key, 0, now - HISTORY_SECONDS)
 
-def get_old_price(symbol, seconds_ago):
-    key = f"prices:{symbol}"
-    target_ts = int(time.time()) - seconds_ago
-    results = r.zrangebyscore(key, target_ts - 2, target_ts + 2, withscores=True)
-    if results:
-        return float(results[0][0])
-    return None
+# تحليل السعر ومقارنة التغير
+def analyze_price_movements(prices):
+    now = time.time()
+    for symbol, price_now in prices.items():
+        key = f"prices:{symbol}"
+        old_5s = r.zrangebyscore(key, now - 5, now, start=0, num=1, withscores=False)
+        old_10s = r.zrangebyscore(key, now - 10, now, start=0, num=1, withscores=False)
+        old_60s = r.zrangebyscore(key, now - 60, now, start=0, num=1, withscores=False)
+        old_180s = r.zrangebyscore(key, now - 180, now, start=0, num=1, withscores=False)
 
-def alert(symbol, tag, percent):
-    last_key = f"alerted:{symbol}"
-    if r.exists(last_key):
-        print(f"⛔ تجاهل الإشعار المكرر لـ {symbol} #{tag}")
-        return
-    r.setex(last_key, ALERT_EXPIRE, "1")
-    message = f"🚀 انفجار {tag}: {symbol} +{percent:.2f}%"
-    send_message(message)
-    try:
-        requests.post(SAQAR_WEBHOOK, json={"text": f"اشتري {symbol}"})
-    except Exception as e:
-        print("❌ فشل الإرسال إلى صقر:", e)
+        def calc_change(old):
+            if old:
+                return ((price_now - float(old[0])) / float(old[0])) * 100
+            return 0
 
-def analyze_symbol(symbol):
-    current = get_old_price(symbol, 0)
-    if not current:
-        return
-    changes = {
-        "5s": (5, 2),
-        "10s": (10, 3),
-        "60s": (60, 4),
-        "180s": (180, 6),
-        "300s": (300, 7),
-    }
-    for tag, (sec, threshold) in changes.items():
-        old = get_old_price(symbol, sec)
-        if not old:
-            continue
-        diff = ((current - old) / old) * 100
-        if diff >= threshold:
-            alert(symbol, tag, diff)
-            break
+        changes = {
+            "5s": calc_change(old_5s),
+            "10s": calc_change(old_10s),
+            "60s": calc_change(old_60s),
+            "180s": calc_change(old_180s)
+        }
 
-def store_loop():
+        for tag, change in changes.items():
+            if change >= 2:
+                last_alert = r.get(f"alerted:{symbol}")
+                if last_alert and time.time() - float(last_alert) < ALERT_EXPIRE:
+                    return
+                r.set(f"alerted:{symbol}", time.time())
+                send_message(f"🚀 انفجار {symbol} خلال {tag}: +{change:.2f}%")
+                if SAQAR_WEBHOOK:
+                    try:
+                        requests.post(SAQAR_WEBHOOK, json={"message": f"اشتري {symbol}"})
+                    except:
+                        print("⚠️ فشل إرسال لـ صقر")
+                break
+
+# تشغيل الدورة الدائمة
+def run_sniper():
     while True:
-        try:
-            prices = fetch_prices()
-            for market, price in prices.items():
-                symbol = market.replace("-EUR", "")
-                store_price(symbol, price)
-            print("✅ تم تخزين الأسعار:", datetime.now().strftime("%H:%M:%S"))
-        except Exception as e:
-            print("❌ خطأ في store_loop:", e)
+        symbols = fetch_symbols()
+        prices = fetch_prices()
+        prices = {s: p for s, p in prices.items() if s in symbols}
+        store_prices(prices)
+        analyze_price_movements(prices)
+        print(f"⏱️ دورة تمّت على {len(prices)} عملة")
         time.sleep(5)
 
-def analyze_loop():
-    while True:
-        try:
-            symbols = fetch_symbols()
-            for symbol in symbols:
-                threading.Thread(target=analyze_symbol, args=(symbol,)).start()
-            print("🔍 تم تحليل الأسعار:", datetime.now().strftime("%H:%M:%S"))
-        except Exception as e:
-            print("❌ خطأ في analyze_loop:", e)
-        time.sleep(30)
-
-@app.route("/")
-def home():
-    return "صياد الصيادين شغال ✅"
-
+# 🧠 Webhook لتلقي أوامر تلغرام (مثلاً /السجل)
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     try:
         data = request.json
         if "message" not in data:
-            return jsonify({"ok": False}), 200
-        text = data["message"].get("text", "")
+            return "ok", 200
+        msg = data["message"]
+        text = msg.get("text", "").lower()
         if "السجل" in text:
-            return jsonify(get_summary()), 200
-        return jsonify({"ok": True}), 200
+            summary = []
+            for key in r.scan_iter("prices:*"):
+                symbol = key.decode().split(":")[1]
+                recent_prices = r.zrange(key, -10, -1)
+                if len(recent_prices) >= 2:
+                    first = float(recent_prices[0])
+                    last = float(recent_prices[-1])
+                    change = ((last - first) / first) * 100
+                    summary.append((symbol, change))
+            top = sorted(summary, key=lambda x: x[1], reverse=True)[:5]
+            text = "\n".join([f"{s}: +{c:.2f}%" for s, c in top]) or "لا نتائج"
+            send_message("📈 أفضل العملات:\n" + text)
+        return "ok", 200
     except Exception as e:
-        print("❌ webhook crashed:", e)
-        return jsonify({"ok": False}), 200
+        print("خطأ في Webhook:", e)
+        return "error", 500
 
-def get_summary():
-    now = int(time.time())
-    top_5_5m = []
-    top_5_10m = []
-
-    symbols = fetch_symbols()
-    for symbol in symbols:
-        now_price = get_old_price(symbol, 0)
-        old_5m = get_old_price(symbol, 300)
-        old_10m = get_old_price(symbol, 600)
-        if now_price and old_5m:
-            diff5 = ((now_price - old_5m) / old_5m) * 100
-            top_5_5m.append((symbol, diff5))
-        if now_price and old_10m:
-            diff10 = ((now_price - old_10m) / old_10m) * 100
-            top_5_10m.append((symbol, diff10))
-
-    top_5_5m = sorted(top_5_5m, key=lambda x: x[1], reverse=True)[:5]
-    top_5_10m = sorted(top_5_10m, key=lambda x: x[1], reverse=True)[:5]
-
-    text = "📈 أقوى العملات خلال 5 دقائق:\n"
-    for s, p in top_5_5m:
-        text += f"{s}: {p:.2f}%\n"
-
-    text += "\n📈 أقوى العملات خلال 10 دقائق:\n"
-    for s, p in top_5_10m:
-        text += f"{s}: {p:.2f}%\n"
-
-    send_message(text)
-    return {"ok": True}
-
-# ✅ شغل كل الخيوط عند تشغيل السكربت
-threading.Thread(target=store_loop).start()
-threading.Thread(target=analyze_loop).start()
+# ✅ بدء التشغيل بالخيط
+threading.Thread(target=run_sniper, daemon=True).start()
