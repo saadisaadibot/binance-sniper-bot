@@ -9,25 +9,37 @@ from websocket import WebSocketApp
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 
+# =========================
 # 🔧 الإعدادات القابلة للتعديل
-MAX_TOP_COINS = 13        # عدد العملات المختارة من Bitvavo في كل دورة
-WATCH_DURATION = 180      # مدة مراقبة السعر بالثواني
-REQUIRED_CHANGE = 1.8     # نسبة الانفجار السعري المطلوبة (%)
-RANK_FILTER = 13          # إرسال الإشعارات فقط للعملات ضمن Top {X}
-SYMBOL_UPDATE_INTERVAL = 180  # الزمن بين كل دورة لجمع العملات (ثانية)
+# =========================
+MAX_TOP_COINS = 10           # عدد العملات المختارة من Bitvavo في كل دورة
+WATCH_DURATION = 180         # مدة نافذة المراقبة بالثواني (لتحديد القاع المحلي)
+RANK_FILTER = 13             # إرسال الإشعارات فقط للعملات ضمن Top {X} على Bitvavo (5m)
+SYMBOL_UPDATE_INTERVAL = 180 # الزمن بين كل دورة لجمع العملات (ثانية)
+
+# 📈 نمط 1% + 1% المتتالي
+STEP_PCT = 1.0               # كل خطوة = 1%
+STEP_GAP_SECONDS = 2         # أقل فرق زمني بين الخطوتين (ثوانٍ)
+MAX_WAIT_AFTER_FIRST = 60    # ⏳ المدة القصوى لانتظار +1% الثانية بعد الأولى (ثواني)
+
+# 🔑 متغيرات البيئة
 REDIS_URL = os.getenv("REDIS_URL")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/"
 IS_RUNNING_KEY = "sniper_running"
+# =========================
 
 app = Flask(__name__)
 r = redis.from_url(REDIS_URL)
 
 def send_message(text):
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": text})
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text},
+            timeout=5
+        )
     except Exception as e:
         print("فشل إرسال الرسالة:", e)
 
@@ -52,6 +64,7 @@ def fetch_top_bitvavo_then_match_binance():
         markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
 
         changes_5m = []
+
         def process(market):
             symbol = market.replace("-EUR", "").upper()
             ch5 = get_candle_change(market, "5m")
@@ -84,7 +97,6 @@ def fetch_top_bitvavo_then_match_binance():
                     not_found.append(coin)
 
         if not_found:
-            # send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(not_found))
             r.sadd("not_found_binance", *not_found)
 
         return matched
@@ -149,7 +161,7 @@ def notify_buy(coin, tag, change=None):
     key = f"buy_alert:{coin}:{tag}"
     last_time = r.get(key)
     if last_time and time.time() - float(last_time) < 900:
-        # حذف هذه الطباعة لا يغيّر أي شيء وظيفي
+        # كولداون 15 دقيقة لنفس (coin, tag)
         return
     r.set(key, time.time())
 
@@ -163,7 +175,7 @@ def notify_buy(coin, tag, change=None):
 
     try:
         payload = {"message": {"text": f"اشتري {coin}"}}
-        resp = requests.post(SAQAR_WEBHOOK, json=payload)
+        resp = requests.post(SAQAR_WEBHOOK, json=payload, timeout=5)
         print(f"🛰️ إرسال إلى صقر: {payload}")
         print(f"🔁 رد صقر: {resp.status_code} - {resp.text}")
     except Exception as e:
@@ -174,6 +186,22 @@ def watch_price(symbol):
     url = f"wss://stream.binance.com:9443/ws/{stream}"
     price_history = deque()
 
+    # حالة 1+1 لكل رمز ضمن هذا الواتشر
+    state = {
+        "base_price": None,        # القاع المحلي ضمن نافذة WATCH_DURATION
+        "first_hit_time": None,    # زمن تحقق +1% الأولى
+        "first_hit_price": None    # السعر عند تحقق +1% الأولى
+    }
+
+    def reset_first_step():
+        state["first_hit_time"] = None
+        state["first_hit_price"] = None
+
+    def reset_all(base_to=None):
+        state["base_price"] = base_to
+        state["first_hit_time"] = None
+        state["first_hit_price"] = None
+
     def on_message(ws, message):
         if r.get(IS_RUNNING_KEY) != b"1":
             ws.close()
@@ -182,6 +210,7 @@ def watch_price(symbol):
         data = json.loads(message)
         if "p" not in data:
             return
+
         try:
             price = float(data["p"])
         except:
@@ -189,20 +218,63 @@ def watch_price(symbol):
 
         now = time.time()
         coin = symbol.replace("USDT", "").replace("BTC", "").replace("EUR", "")
+
+        # تاريخ الأسعار ضمن النافذة
         price_history.append((now, price))
         while price_history and now - price_history[0][0] > WATCH_DURATION:
             price_history.popleft()
 
-        if len(price_history) > 1:
-            min_price = min(p[1] for p in price_history)
-            change = ((price - min_price) / min_price) * 100
-            if change >= REQUIRED_CHANGE:
-                duration = int(now - price_history[0][0])
-                change_str = f"{change:.2f}% خلال {duration} ثانية"
-                notify_buy(coin, f"{WATCH_DURATION}s", change_str)
+        if len(price_history) < 2:
+            return
 
-    def on_close(ws): time.sleep(2); threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
-    def on_error(ws, error): print(f"[{symbol}] خطأ:", error)
+        # حدّث القاع المحلي ضمن النافذة
+        window_min_price = min(p for _, p in price_history)
+
+        # إذا لم تكن لدينا قاعدة، أو القاع انخفض → نعيد الضبط على القاع الجديد
+        if state["base_price"] is None or window_min_price < state["base_price"]:
+            reset_all(base_to=window_min_price)
+
+        # (جديد) إلغاء التريغر الأول إذا تأخرت +1% الثانية أكثر من المهلة القصوى
+        if state["first_hit_time"] and (now - state["first_hit_time"]) > MAX_WAIT_AFTER_FIRST:
+            reset_first_step()
+
+        # عتبة الخطوة الأولى (+1% على القاع المحلي)
+        first_threshold = state["base_price"] * (1 + STEP_PCT / 100.0)
+
+        # 1) التريغر الأول: السعر يصل +1% من القاع
+        if state["first_hit_time"] is None:
+            if price >= first_threshold:
+                state["first_hit_time"] = now
+                state["first_hit_price"] = price
+            return
+
+        # 2) التريغر الثاني: +1% إضافية فوق سعر الخطوة الأولى وبفاصل زمني أدنى
+        second_threshold = state["first_hit_price"] * (1 + STEP_PCT / 100.0)
+        time_gap_ok = (now - state["first_hit_time"]) >= STEP_GAP_SECONDS
+
+        if time_gap_ok and price >= second_threshold:
+            duration = int(now - state["first_hit_time"])
+            total_change = ((price - state["base_price"]) / state["base_price"]) * 100.0
+            change_str = f"{total_change:.2f}% خلال {duration} ثانية"
+
+            # إشعار بشرط 1+1 المتتالي
+            notify_buy(coin, f"{WATCH_DURATION}s", change_str)
+
+            # صفّر الحالة بالكامل لالتقاط فرص جديدة لاحقًا
+            reset_all(base_to=None)
+            return
+
+        # (اختياري) إذا هبط السعر كثيرًا بعد الخطوة الأولى نلغيها لمنع تريغرات وهمية
+        # مثال: هبوط -0.5% من first_hit_price يعيد ضبط الخطوة الأولى
+        # if state["first_hit_time"] and price <= state["first_hit_price"] * 0.995:
+        #     reset_first_step()
+
+    def on_close(ws):
+        time.sleep(2)
+        threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
+
+    def on_error(ws, error):
+        print(f"[{symbol}] خطأ:", error)
 
     ws = WebSocketApp(url, on_message=on_message, on_close=on_close, on_error=on_error)
     ws.run_forever()
