@@ -31,7 +31,11 @@ RANK_CACHE_TTL = 15           # كاش ترتيب 5m بالثواني للاست
 REDIS_URL = os.getenv("REDIS_URL")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/"
+# فضّل ضبطه من .env (إن كان عندك على الروت خلي المتغير = الرابط الأساسي، وإن عندك مسار /webhook حطه كامل)
+SAQAR_WEBHOOK = os.getenv(
+    "SAQAR_WEBHOOK",
+    "https://saadisaadibot-saqarxbo-production.up.railway.app/webhook"
+)
 IS_RUNNING_KEY = "sniper_running"
 # =========================
 
@@ -51,7 +55,7 @@ def send_message(text):
 def get_candle_change(market, interval):
     try:
         url = f"https://api.bitvavo.com/v2/{market}/candles?interval={interval}&limit=2"
-        res = requests.get(url, timeout=3)
+        res = requests.get(url, timeout=5)
         data = res.json()
         if not isinstance(data, list) or len(data) < 2:
             return None
@@ -62,48 +66,82 @@ def get_candle_change(market, interval):
         print(f"❌ خطأ في get_candle_change لـ {market}: {e}")
         return None
 
+# =========================
+# 🧭 مطابقة Binance + كاش
+# =========================
+def fetch_binance_symbols_cached():
+    """ExchangeInfo من Binance مع كاش 10 دقائق لتخفيف الضغط"""
+    try:
+        cache_key = "binance:exchangeInfo"
+        cached = r.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+        info = requests.get(
+            "https://api.binance.com/api/v3/exchangeInfo", timeout=8
+        ).json()
+        # نخزن كل الشيء كما هو
+        r.setex(cache_key, 600, json.dumps(info))
+        return info
+    except Exception as e:
+        print("⚠️ خطأ في fetch_binance_symbols_cached:", e)
+        return {"symbols": []}
+
+def prefer_pair(base, symbols):
+    """نفضّل USDT ثم EUR ثم BTC للـ baseAsset المعطى"""
+    base = base.upper()
+    candidates = [s for s in symbols if s.get("baseAsset", "").upper() == base and s.get("status") == "TRADING"]
+    if not candidates:
+        return None
+    for quote in ("USDT", "EUR", "BTC"):
+        for s in candidates:
+            if s.get("quoteAsset") == quote:
+                return s.get("symbol")
+    # fallback: أول واحد متاح
+    return candidates[0].get("symbol")
+
+# aliases لبعض الحالات اللي بتختلف أسماؤها بين المنصتين (أضف عند الحاجة)
+ALIASES = {
+    # "ICNT": "ICNT",  # مثال توضيحي — ضيف التحويلات الفعلية عند اكتشافها
+}
+
 def fetch_top_bitvavo_then_match_binance():
+    """نجمع Top من Bitvavo (5m)، بعدها نطابق لـ Binance بأفضل زوج"""
     try:
         r.delete("not_found_binance")
-        markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
-        markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
-
-        changes_5m = []
+        markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=8).json()
+        markets = [m["market"] for m in markets_res if m.get("market", "").endswith("-EUR")]
 
         def process(market):
             symbol = market.replace("-EUR", "").upper()
             ch5 = get_candle_change(market, "5m")
             return (symbol, ch5)
 
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            results = executor.map(process, markets)
-            for sym, ch5 in results:
+        changes_5m = []
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            for sym, ch5 in ex.map(process, markets):
                 if ch5 is not None:
                     changes_5m.append((sym, ch5))
 
-        top_symbols = sorted(changes_5m, key=lambda x: x[1], reverse=True)[:MAX_TOP_COINS]
-        combined = list({s for s, _ in top_symbols})
-        print(f"📊 العملات المختارة من Bitvavo (5m): {len(combined)} → {combined}")
+        top_symbols = [s for s, _ in sorted(changes_5m, key=lambda x: x[1], reverse=True)[:MAX_TOP_COINS]]
+        top_symbols = list(dict.fromkeys(top_symbols))  # إزالة تكرارات احتياطًا
 
-        exchange_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
-        binance_pairs = {s["symbol"] for s in exchange_info["symbols"] if s["status"] == "TRADING"}
-        symbol_map = {s["baseAsset"].upper(): s["symbol"] for s in exchange_info["symbols"] if s["status"] == "TRADING"}
+        info = fetch_binance_symbols_cached()
+        symbols = info.get("symbols", [])
 
         matched, not_found = [], []
-        for coin in combined:
-            coin_upper = coin.upper()
-            if coin_upper in symbol_map:
-                matched.append(symbol_map[coin_upper])
+        for coin in top_symbols:
+            base = ALIASES.get(coin, coin).upper()
+            best = prefer_pair(base, symbols)
+            if best:
+                matched.append(best)
             else:
-                possible_matches = [s for s in binance_pairs if s.startswith(coin_upper)]
-                if possible_matches:
-                    matched.append(possible_matches[0])
-                else:
-                    not_found.append(coin)
+                not_found.append(coin)
 
         if not_found:
             r.sadd("not_found_binance", *not_found)
 
+        print(f"📊 Bitvavo top: {top_symbols} → Binance matched: {matched}")
         return matched
 
     except Exception as e:
@@ -122,8 +160,8 @@ def get_rank_from_bitvavo(coin_symbol, *, force_refresh=False):
                 sorted_changes = json.loads(cached)
 
         if sorted_changes is None:
-            markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
-            markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
+            markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=8).json()
+            markets = [m["market"] for m in markets_res if m.get("market", "").endswith("-EUR")]
 
             changes = []
             for market in markets:
@@ -133,7 +171,6 @@ def get_rank_from_bitvavo(coin_symbol, *, force_refresh=False):
                     changes.append((symbol, ch5))
 
             sorted_changes = sorted(changes, key=lambda x: x[1], reverse=True)
-            # نخزن الكل كقائمة [ [symbol, change], ... ]
             r.setex(cache_key, RANK_CACHE_TTL, json.dumps(sorted_changes))
 
         for i, (symbol, _) in enumerate(sorted_changes, 1):
@@ -148,7 +185,7 @@ def is_last_1m_green(coin_symbol):
     try:
         market = f"{coin_symbol.upper()}-EUR"
         url = f"https://api.bitvavo.com/v2/{market}/candles?interval=1m&limit=2"
-        res = requests.get(url, timeout=3).json()
+        res = requests.get(url, timeout=5).json()
         if isinstance(res, list) and len(res) >= 2:
             o = float(res[-2][1]); c = float(res[-2][4])
             return c >= o
@@ -173,9 +210,9 @@ def notify_buy(coin, tag, change=None):
     prev_key, prev_ts_key = f"rank_prev:{coin}", f"rank_prev_ts:{coin}"
     prev = r.get(prev_key)
     prev = int(prev) if prev else None
-    now = time.time()
+    now_ts = time.time()
     r.set(prev_key, rank)
-    r.set(prev_ts_key, now)
+    r.set(prev_ts_key, now_ts)
 
     just_entered = (prev is None) or (prev > RANK_FILTER and rank <= RANK_FILTER)
     improved     = (prev is not None) and ((prev - rank) >= IMPROVEMENT_STEPS)
@@ -197,7 +234,7 @@ def notify_buy(coin, tag, change=None):
 
     try:
         payload = {"message": {"text": f"اشتري {coin}"}}
-        resp = requests.post(SAQAR_WEBHOOK, json=payload, timeout=5)
+        resp = requests.post(SAQAR_WEBHOOK, json=payload, timeout=8)
         print(f"🛰️ إرسال إلى صقر: {payload}")
         print(f"🔁 رد صقر: {resp.status_code} - {resp.text}")
     except Exception as e:
@@ -229,17 +266,20 @@ def cleanup_old_coins():
     for sym, ts in r.hgetall("watchlist").items():
         try:
             t = float(ts.decode())
+            # نحذف بعد ~50 دقيقة (يمكن تعديلها)
             if now - t > 3000:
                 r.hdel("watchlist", sym.decode())
         except:
             continue
 
+# =========================
+# 🔌 WebSocket watcher بباك-اوف
+# =========================
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
     url = f"wss://stream.binance.com:9443/ws/{stream}"
-    price_history = deque()
 
-    # حالة 1+1 لكل رمز ضمن هذا الواتشر
+    price_history = deque()
     state = {
         "base_price": None,        # القاع المحلي ضمن نافذة WATCH_DURATION
         "first_hit_time": None,    # زمن تحقق +1% الأولى
@@ -260,13 +300,17 @@ def watch_price(symbol):
             ws.close()
             return
 
-        data = json.loads(message)
+        try:
+            data = json.loads(message)
+        except Exception:
+            return
+
         if "p" not in data:
             return
 
         try:
             price = float(data["p"])
-        except:
+        except Exception:
             return
 
         now = time.time()
@@ -321,15 +365,25 @@ def watch_price(symbol):
         # if state["first_hit_time"] and price <= state["first_hit_price"] * 0.995:
         #     reset_first_step()
 
-    def on_close(ws):
-        time.sleep(2)
-        threading.Thread(target=watch_price, args=(symbol,), daemon=True).start()
-
-    def on_error(ws, error):
-        print(f"[{symbol}] خطأ:", error)
-
-    ws = WebSocketApp(url, on_message=on_message, on_close=on_close, on_error=on_error)
-    ws.run_forever()
+    backoff = 1
+    while True:
+        if r.get(IS_RUNNING_KEY) != b"1":
+            time.sleep(2)
+            continue
+        try:
+            ws = WebSocketApp(
+                url,
+                on_message=on_message
+            )
+            # ترسل Ping تلقائيًا وتحافظ على الاتصال
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+            print(f"[{symbol}] اتصال مُغلق. إعادة المحاولة بعد {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)  # backoff بسيط
+        except Exception as e:
+            print(f"[{symbol}] خطأ في ws: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
 def watcher_loop():
     watched = set()
@@ -340,6 +394,7 @@ def watcher_loop():
 
         coins = r.hkeys("watchlist")
         symbols = {c.decode() for c in coins}
+        # شغّل ووتشر لكل رمز جديد فقط
         for sym in symbols - watched:
             threading.Thread(target=watch_price, args=(sym,), daemon=True).start()
             watched.add(sym)
@@ -391,4 +446,5 @@ if __name__ == "__main__":
     r.set(IS_RUNNING_KEY, "1")
     threading.Thread(target=update_symbols_loop, daemon=True).start()
     threading.Thread(target=watcher_loop, daemon=True).start()
+    # على Railway ما منستخدم app.run عادة، بس خليها محليًا
     app.run(host="0.0.0.0", port=8080)
