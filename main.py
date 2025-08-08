@@ -119,7 +119,7 @@ def cleanup_old_coins():
     for sym, ts in r.hgetall("watchlist").items():
         try:
             t = float(ts.decode())
-            if now - t > 2400:
+            if now - t > 3000:
                 r.hdel("watchlist", sym.decode())
         except:
             continue
