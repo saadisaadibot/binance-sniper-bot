@@ -12,15 +12,20 @@ from collections import deque
 # =========================
 # 🔧 الإعدادات القابلة للتعديل
 # =========================
-MAX_TOP_COINS = 10           # عدد العملات المختارة من Bitvavo في كل دورة
-WATCH_DURATION = 180         # مدة نافذة المراقبة بالثواني (لتحديد القاع المحلي)
-RANK_FILTER = 13             # إرسال الإشعارات فقط للعملات ضمن Top {X} على Bitvavo (5m)
-SYMBOL_UPDATE_INTERVAL = 180 # الزمن بين كل دورة لجمع العملات (ثانية)
+MAX_TOP_COINS = 10            # عدد العملات المختارة من Bitvavo في كل دورة
+WATCH_DURATION = 180          # مدة نافذة المراقبة بالثواني (لتحديد القاع المحلي)
+RANK_FILTER = 10              # إرسال الإشعارات فقط للعملات ضمن Top {X} على Bitvavo (5m)
+SYMBOL_UPDATE_INTERVAL = 180  # الزمن بين كل دورة لجمع العملات (ثانية)
 
 # 📈 نمط 1% + 1% المتتالي
-STEP_PCT = 1.0               # كل خطوة = 1%
-STEP_GAP_SECONDS = 2         # أقل فرق زمني بين الخطوتين (ثوانٍ)
-MAX_WAIT_AFTER_FIRST = 60    # ⏳ المدة القصوى لانتظار +1% الثانية بعد الأولى (ثواني)
+STEP_PCT = 1.0                # كل خطوة = 1%
+STEP_GAP_SECONDS = 2          # أقل فرق زمني بين الخطوتين (ثوانٍ)
+MAX_WAIT_AFTER_FIRST = 60     # ⏳ المدة القصوى لانتظار +1% الثانية بعد الأولى (ثواني)
+
+# 🧠 فلترة لحظية عند الإشعار
+IMPROVEMENT_STEPS = 3         # كم مرتبة لازم تتحسن بالتوب ليمر الإشعار إن لم يكن دخول جديد
+REQUIRE_LAST_1M_GREEN = True  # تأكيد أن آخر شمعة 1m خضراء قبل الإرسال (اختياري لكن مفيد)
+RANK_CACHE_TTL = 15           # كاش ترتيب 5m بالثواني للاستعلامات العامة (نتجاوز الكاش وقت الإرسال)
 
 # 🔑 متغيرات البيئة
 REDIS_URL = os.getenv("REDIS_URL")
@@ -105,6 +110,99 @@ def fetch_top_bitvavo_then_match_binance():
         print("❌ خطأ في fetch_top_bitvavo_then_match_binance:", e)
         return []
 
+# --- كاش خفيف لترتيب Bitvavo (نتجاوزه وقت الإرسال) ---
+def get_rank_from_bitvavo(coin_symbol, *, force_refresh=False):
+    try:
+        cache_key = "rank_cache:all"
+        sorted_changes = None
+
+        if not force_refresh:
+            cached = r.get(cache_key)
+            if cached:
+                sorted_changes = json.loads(cached)
+
+        if sorted_changes is None:
+            markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
+            markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
+
+            changes = []
+            for market in markets:
+                symbol = market.replace("-EUR", "").upper()
+                ch5 = get_candle_change(market, "5m")
+                if ch5 is not None:
+                    changes.append((symbol, ch5))
+
+            sorted_changes = sorted(changes, key=lambda x: x[1], reverse=True)
+            # نخزن الكل كقائمة [ [symbol, change], ... ]
+            r.setex(cache_key, RANK_CACHE_TTL, json.dumps(sorted_changes))
+
+        for i, (symbol, _) in enumerate(sorted_changes, 1):
+            if symbol == coin_symbol.upper():
+                return i
+        return None
+    except Exception as e:
+        print(f"⚠️ خطأ في get_rank_from_bitvavo: {e}")
+        return None
+
+def is_last_1m_green(coin_symbol):
+    try:
+        market = f"{coin_symbol.upper()}-EUR"
+        url = f"https://api.bitvavo.com/v2/{market}/candles?interval=1m&limit=2"
+        res = requests.get(url, timeout=3).json()
+        if isinstance(res, list) and len(res) >= 2:
+            o = float(res[-2][1]); c = float(res[-2][4])
+            return c >= o
+    except Exception as e:
+        print("⚠️ فشل التحقق من شمعة 1m:", e)
+    return True  # لا نمنع الإشعار بسبب خطأ شبكي
+
+def notify_buy(coin, tag, change=None):
+    key = f"buy_alert:{coin}:{tag}"
+    last_time = r.get(key)
+    if last_time and time.time() - float(last_time) < 900:
+        # كولداون 15 دقيقة لنفس (coin, tag)
+        return
+
+    # 🚦 حساب الترتيب الآن بلا كاش (فلترة حديثة حقيقية)
+    rank = get_rank_from_bitvavo(coin, force_refresh=True)
+    if not rank or rank > RANK_FILTER:
+        print(f"⛔ تجاهل الإشعار لأن {coin} خارج التوب {RANK_FILTER} حالياً (rank={rank}).")
+        return
+
+    # ✅ دخل التوب مؤخرًا أو تحسّن بوضوح
+    prev_key, prev_ts_key = f"rank_prev:{coin}", f"rank_prev_ts:{coin}"
+    prev = r.get(prev_key)
+    prev = int(prev) if prev else None
+    now = time.time()
+    r.set(prev_key, rank)
+    r.set(prev_ts_key, now)
+
+    just_entered = (prev is None) or (prev > RANK_FILTER and rank <= RANK_FILTER)
+    improved     = (prev is not None) and ((prev - rank) >= IMPROVEMENT_STEPS)
+
+    if not (just_entered or improved):
+        print(f"⛔ {coin}: داخل التوب سابقًا بدون تحسّن كافٍ (prev={prev} → now={rank}).")
+        return
+
+    # (اختياري) تأكيد الشمعة 1m خضراء
+    if REQUIRE_LAST_1M_GREEN and (not is_last_1m_green(coin)):
+        print(f"⛔ {coin}: آخر شمعة 1m ليست خضراء — تجاهل الإشعار.")
+        return
+
+    # كل الشروط تمام → فعّل الكولداون وأرسل
+    r.set(key, time.time())
+
+    msg = f"🚀 {coin} انفجرت بـ {change}  #top{rank}" if change else f"🚀 انفجار {tag}: {coin} #top{rank}"
+    send_message(msg)
+
+    try:
+        payload = {"message": {"text": f"اشتري {coin}"}}
+        resp = requests.post(SAQAR_WEBHOOK, json=payload, timeout=5)
+        print(f"🛰️ إرسال إلى صقر: {payload}")
+        print(f"🔁 رد صقر: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        print("❌ فشل الإرسال إلى صقر:", e)
+
 def update_symbols_loop():
     while True:
         if r.get(IS_RUNNING_KEY) != b"1":
@@ -135,51 +233,6 @@ def cleanup_old_coins():
                 r.hdel("watchlist", sym.decode())
         except:
             continue
-
-def get_rank_from_bitvavo(coin_symbol):
-    try:
-        markets_res = requests.get("https://api.bitvavo.com/v2/markets", timeout=5).json()
-        markets = [m["market"] for m in markets_res if m["market"].endswith("-EUR")]
-
-        changes = []
-        for market in markets:
-            symbol = market.replace("-EUR", "").upper()
-            ch5 = get_candle_change(market, "5m")
-            if ch5 is not None:
-                changes.append((symbol, ch5))
-
-        sorted_changes = sorted(changes, key=lambda x: x[1], reverse=True)
-        for i, (symbol, _) in enumerate(sorted_changes, 1):
-            if symbol == coin_symbol.upper():
-                return i
-        return None
-    except Exception as e:
-        print(f"⚠️ خطأ في get_rank_from_bitvavo: {e}")
-        return None
-
-def notify_buy(coin, tag, change=None):
-    key = f"buy_alert:{coin}:{tag}"
-    last_time = r.get(key)
-    if last_time and time.time() - float(last_time) < 900:
-        # كولداون 15 دقيقة لنفس (coin, tag)
-        return
-    r.set(key, time.time())
-
-    rank = get_rank_from_bitvavo(coin)
-    if not rank or rank > RANK_FILTER:
-        print(f"⛔ تجاهل الإشعار لأن {coin} ترتيبها خارج التوب {RANK_FILTER} أو غير معروف.")
-        return
-
-    msg = f"🚀 {coin} انفجرت بـ {change}  #top{rank}" if change else f"🚀 انفجار {tag}: {coin} #top{rank}"
-    send_message(msg)
-
-    try:
-        payload = {"message": {"text": f"اشتري {coin}"}}
-        resp = requests.post(SAQAR_WEBHOOK, json=payload, timeout=5)
-        print(f"🛰️ إرسال إلى صقر: {payload}")
-        print(f"🔁 رد صقر: {resp.status_code} - {resp.text}")
-    except Exception as e:
-        print("❌ فشل الإرسال إلى صقر:", e)
 
 def watch_price(symbol):
     stream = f"{symbol.lower()}@trade"
@@ -257,7 +310,7 @@ def watch_price(symbol):
             total_change = ((price - state["base_price"]) / state["base_price"]) * 100.0
             change_str = f"{total_change:.2f}% خلال {duration} ثانية"
 
-            # إشعار بشرط 1+1 المتتالي
+            # إشعار بشرط 1+1 المتتالي (مع فلترة لحظية جوّا notify_buy)
             notify_buy(coin, f"{WATCH_DURATION}s", change_str)
 
             # صفّر الحالة بالكامل لالتقاط فرص جديدة لاحقًا
@@ -265,7 +318,6 @@ def watch_price(symbol):
             return
 
         # (اختياري) إذا هبط السعر كثيرًا بعد الخطوة الأولى نلغيها لمنع تريغرات وهمية
-        # مثال: هبوط -0.5% من first_hit_price يعيد ضبط الخطوة الأولى
         # if state["first_hit_time"] and price <= state["first_hit_price"] * 0.995:
         #     reset_first_step()
 
