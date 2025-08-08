@@ -84,7 +84,7 @@ def fetch_top_bitvavo_then_match_binance():
                     not_found.append(coin)
 
         if not_found:
-            send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(not_found))
+            # send_message("🚫 عملات غير موجودة على Binance:\n" + ", ".join(not_found))
             r.sadd("not_found_binance", *not_found)
 
         return matched
