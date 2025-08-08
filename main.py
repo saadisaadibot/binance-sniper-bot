@@ -13,7 +13,7 @@ from collections import deque
 MAX_TOP_COINS = 12        # عدد العملات المختارة من Bitvavo في كل دورة
 WATCH_DURATION = 180      # مدة مراقبة السعر بالثواني
 REQUIRED_CHANGE = 2     # نسبة الانفجار السعري المطلوبة (%)
-RANK_FILTER = 12          # إرسال الإشعارات فقط للعملات ضمن Top {X}
+RANK_FILTER = 15          # إرسال الإشعارات فقط للعملات ضمن Top {X}
 SYMBOL_UPDATE_INTERVAL = 180  # الزمن بين كل دورة لجمع العملات (ثانية)
 REDIS_URL = os.getenv("REDIS_URL")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
