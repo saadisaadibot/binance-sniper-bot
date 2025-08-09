@@ -34,7 +34,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 # فضّل ضبطه من .env (إن كان عندك على الروت خلي المتغير = الرابط الأساسي، وإن عندك مسار /webhook حطه كامل)
 SAQAR_WEBHOOK = os.getenv(
     "SAQAR_WEBHOOK",
-    "https://saadisaadibot-saqarxbo-production.up.railway.app/webhook"
+    "https://saadisaadibot-saqarxbo-production.up.railway.app/"
 )
 IS_RUNNING_KEY = "sniper_running"
 # =========================
