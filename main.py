@@ -137,7 +137,7 @@ def bitvavo_markets_changes():
         if len(changes) >= 4:
             p75 = statistics.quantiles(changes, n=4)[2]
         else:
-            p75 = sorted(changes)[int(len(changes)*0.75) - 1] if len(changes) > 1 else changes[0]
+            p75 = sorted(changes)[max(0, int(len(changes)*0.75) - 1)] if len(changes) > 1 else changes[0]
         arr.sort(key=lambda x:x[1], reverse=True)
         return arr, med, p75
     except Exception as e:
@@ -155,7 +155,7 @@ def filter_binance_tradables(candidates):
         name = s.get("symbol","")
         if any(name.endswith(x) for x in ("UPUSDT","DOWNUSDT","BULLUSDT","BEARUSDT")):
             continue
-        ok.append(sym)  # لا نعقّد الـNOTIONAL هنا
+        ok.append(sym)
     return ok
 
 def fetch_top_bitvavo_then_match_binance():
@@ -163,6 +163,7 @@ def fetch_top_bitvavo_then_match_binance():
         r.delete("not_found_binance")
         sorted_changes, med, p75 = bitvavo_markets_changes()
         if sorted_changes:
+            r.setex(RANK_CACHE_ALL, RANK_CACHE_TTL, json.dumps(sorted_changes))
             r.setex("market:breadth:med", 60, str(med))
             r.setex("market:breadth:p75", 60, str(p75))
         top_syms = [s for s,_ in sorted_changes[:MAX_TOP_COINS]]
@@ -175,7 +176,7 @@ def fetch_top_bitvavo_then_match_binance():
             (matched.append(best) if best else not_found.append(c))
         if not_found: r.sadd("not_found_binance", *not_found)
         matched = filter_binance_tradables(matched)
-        print(f"📊 Bitvavo top → Binance tradables:", matched)
+        print(f"📊 Bitvavo top → Binance tradables: {matched}")
         return matched
     except Exception as e:
         print("❌ fetch_top:", e); return []
@@ -188,7 +189,6 @@ def get_rank_from_bitvavo(coin, *, force_refresh=False):
             if cached:
                 sorted_changes = json.loads(cached)
         if sorted_changes is None:
-            # كمل احتياطاً، بس لا تستدعي كثيراً
             sorted_changes, _, _ = bitvavo_markets_changes()
             r.setex(RANK_CACHE_ALL, RANK_CACHE_TTL, json.dumps(sorted_changes))
         for i,(s,_) in enumerate(sorted_changes,1):
@@ -296,7 +296,6 @@ def fail_blacklist(coin, seconds):
 # الإشعار النهائي
 # =========================
 def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
-    # كولداون لكل عملة/وسم
     key = f"buy_alert:{coin}:{tag}"
     last = r.get(key)
     if last and time.time() - float(last) < ALERT_COOLDOWN_SEC:
@@ -311,7 +310,6 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
     if not rank or rank > max_rank:
         print(f"⛔ {coin} خارج التوب {max_rank} (rank={rank})."); return
 
-    # تحسّن أو دخول جديد
     prev_k, prev_ts_k = f"rank_prev:{coin}", f"rank_prev_ts:{coin}"
     prev = r.get(prev_k); prev = int(prev) if prev else None
     r.set(prev_k, rank); r.set(prev_ts_k, time.time())
@@ -324,12 +322,15 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
         print(f"⛔ {coin} شمعة 1m ليست خضراء."); return
 
     v_now, v_avg = get_1m_volume(coin)
-    # عتبة حجم تكيفية حسب حرارة السوق
     med = float(r.get("market:breadth:med") or "0")
     p75 = float(r.get("market:breadth:p75") or "0")
     vol_mult = BASE_VOL_SPIKE_MULT - (0.2 if p75 >= 1.0 else 0.0) + (0.2 if p75 <= 0.1 else 0.0)
     if not (v_now and v_avg and v_now >= vol_mult * v_avg):
-        print(f"⛔ {coin} حجم غير كافٍ {v_now:.2f} < {vol_mult:.2f}×{v_avg:.2f}."); return
+        try:
+            print(f"⛔ {coin} حجم غير كافٍ {v_now:.2f} < {vol_mult:.2f}×{v_avg:.2f}.")
+        except Exception:
+            print(f"⛔ {coin} حجم غير كافٍ.")
+        return
 
     r.set(key, time.time())
     msg = f"🚀 {coin} setup مدروس #top{rank}" if not change_text else f"🚀 {coin} {change_text} #top{rank}"
@@ -338,7 +339,6 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
         payload = {"message": {"text": f"اشتري {coin}"}}
         resp = requests.post(SAQAR_WEBHOOK, json=payload, timeout=8)
         print(f"🛰️ صقر <= {payload} | {resp.status_code} {resp.text[:120]}")
-        # مراقبة دروداون ما بعد الإرسال (حظر مؤقت عند اللزوم)
         r.setex(f"postsend:watch:{coin}", 12, "1")
     except Exception as e:
         print("❌ إرسال صقر:", e)
@@ -360,7 +360,6 @@ def start_combined_ws(symbols, gen):
         st["score_hold_start"] = None
 
     def on_message(ws, message):
-        # أغلق إذا GEN تغيّر أو التشغيل متوقف
         cur_gen = int(r.get("ws:gen") or b"0")
         if cur_gen != gen or r.get(IS_RUNNING_KEY) != b"1":
             ws.close(); return
@@ -378,19 +377,16 @@ def start_combined_ws(symbols, gen):
         now = time.time()
         coin = symbol.replace("USDT","").replace("BTC","").replace("EUR","")
 
-        # تحديث التاريخ
         ph = st["price_history"]
         ph.append((now, price))
         while ph and now - ph[0][0] > WATCH_DURATION:
             ph.popleft()
         if len(ph) < 6: return
 
-        # حرارة السوق لتكييف العتبات
         p75 = float(r.get("market:breadth:p75") or "0")
         SCORE_THRESHOLD = BASE_SCORE_THRESHOLD - (1.0 if p75 >= 1.5 else 0.0) + (0.5 if p75 <= 0.1 else 0.0)
         HOLD_SECONDS  = BASE_HOLD_SECONDS + (1.0 if p75 <= 0.0 else 0.0)
 
-        # ============= نظام النقاط =============
         S = 0
         details = []
 
@@ -428,9 +424,9 @@ def start_combined_ws(symbols, gen):
         if count_higher_lows(ph, 120, HL_MIN_GAP_SEC, HL_MIN_DIFF_PCT) >= HIGHER_LOWS_REQUIRED:
             S += 1; details.append("HL")
 
-        # 5/6) ترتيب + حجم (نؤجّل حتى شبه تأكيد)
+        # 5/6) ترتيب + حجم
         if S >= (SCORE_THRESHOLD - 2):
-            rank_now = get_rank_from_bitvavo(coin)  # بدون force_refresh
+            rank_now = get_rank_from_bitvavo(coin)
             v_now, v_avg = get_1m_volume(coin)
             vol_mult = BASE_VOL_SPIKE_MULT - (0.2 if p75 >= 1.0 else 0.0) + (0.2 if p75 <= 0.1 else 0.0)
             if rank_now and rank_now <= RANK_MAX and v_now and v_avg and v_now >= vol_mult*v_avg:
@@ -451,25 +447,21 @@ def start_combined_ws(symbols, gen):
             reset_score(st); hold_ok = False
 
         kill = False
-        # لا رجوع قوي بعد الاختراق بأول 10s
         if breakout_ok and st["breakout_price"] and st["score_hold_start"]:
             if (price < st["breakout_price"]*(1 - RETEST_MAX_DROP_PCT/100.0)) and (now - st["score_hold_start"] <= 10):
                 kill = True
-        # لا ويك طويل
         p5ago = value_at(ph, 5)
         if p5ago and ((p5ago - price)/p5ago*100.0) >= LONG_WICK_DROP_PCT:
             kill = True
 
-        # مراقبة دروداون ما بعد إرسال سابق
         if r.get(f"postsend:watch:{coin}"):
             base_price = st.get("last_send_price")
             if base_price:
                 dd = (base_price - price)/base_price*100.0
                 if dd >= POST_SEND_MAX_DD_PCT:
-                    fail_blacklist(coin, ALERT_COOLDOWN_SEC)  # حظر مؤقت
+                    fail_blacklist(coin, ALERT_COOLDOWN_SEC)
                     r.delete(f"postsend:watch:{coin}")
 
-        # إرسال الإشارة
         if ENABLE_SCORE_SIGNAL and hold_ok and not kill:
             if time.time() - st["last_sent"] > 2:
                 change_txt = f"setup مدروس S={S} ({'+'.join(details)})"
@@ -477,7 +469,6 @@ def start_combined_ws(symbols, gen):
                 notify_buy(coin, "setup", change_txt, allow_rank_max=True)
                 st["last_sent"] = time.time()
                 reset_score(st)
-        # ========================================
 
     backoff = 1
     while True:
@@ -499,14 +490,12 @@ def update_symbols_loop():
     while True:
         if r.get(IS_RUNNING_KEY) != b"1": time.sleep(5); continue
         print("🌀 دورة جديدة لجلب التوب...")
-        # --- جلب الرتب مرة لكل دورة وتخزينها ---
         sorted_changes, med, p75 = bitvavo_markets_changes()
         if sorted_changes:
             r.setex(RANK_CACHE_ALL, RANK_CACHE_TTL, json.dumps(sorted_changes))
             r.setex("market:breadth:med", 60, str(med))
             r.setex("market:breadth:p75", 60, str(p75))
-        # ---------------------------------------
-        top_symbols = fetch_top_bitvavo_then_match_binance()  # يستخدم نفس الدالة كما هي
+        top_symbols = fetch_top_bitvavo_then_match_binance()
         if not top_symbols:
             send_message("⚠️ لا عملات صالحة في هذه الدورة.")
             time.sleep(SYMBOL_UPDATE_INTERVAL); continue
@@ -514,13 +503,11 @@ def update_symbols_loop():
         for s in top_symbols: r.hset("watchlist", s, now)
         print(f"📡 حدّثنا المراقبة: {len(top_symbols)} رمز.")
         cleanup_old_coins()
-        # إدارة GEN للـWS
         coins = r.hkeys("watchlist")
         symbols = sorted({c.decode() for c in coins})
-        active = json.loads(r.get(ACTIVE_WS_SET_KEY) or "[]")
-        if symbols and symbols != active:
+        active = set(json.loads(r.get(ACTIVE_WS_SET_KEY) or "[]"))
+        if symbols and set(symbols) != active:   # 👈 مقارنة set لتفادي إعادة فتح بلا داعي
             r.set(ACTIVE_WS_SET_KEY, json.dumps(symbols))
-            # زِيادة GEN لإجبار القديم على الإغلاق
             gen = int(r.get("ws:gen") or b"0") + 1
             r.set("ws:gen", gen)
             threading.Thread(target=start_combined_ws, args=(symbols, gen), daemon=True).start()
@@ -581,8 +568,12 @@ def telegram_webhook():
         else:
             send_message("🚫 لا توجد عملات قيد المراقبة.")
     elif txt == "reset":
-        r.delete("watchlist"); r.delete(RANK_CACHE_ALL); r.delete(GLOBAL_BUDGET_KEY)
+        # تنظيف شامل بدون تغيير منطق العمل
+        for k in r.scan_iter("buy_alert:*"): r.delete(k)
+        for k in r.scan_iter("rank_prev:*"): r.delete(k)
         for k in r.scan_iter("postsend:watch:*"): r.delete(k)
+        for k in r.scan_iter(f"{FAIL_BLACKLIST_PREFIX}*"): r.delete(k)
+        r.delete("watchlist"); r.delete(RANK_CACHE_ALL); r.delete(GLOBAL_BUDGET_KEY)
         r.delete(ACTIVE_WS_SET_KEY)
         r.incr("ws:gen")  # إجبار كل WS على الإغلاق فوراً
         send_message("🧹 مسحنا الذاكرة. ستُحدَّث القوائم بالدورة القادمة.")
