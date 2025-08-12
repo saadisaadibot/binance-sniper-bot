@@ -127,22 +127,25 @@ def bitvavo_markets_changes():
         markets = [m["market"] for m in markets_res if m.get("market","").endswith("-EUR")]
         arr = []
         for m in markets:
-            s = m.replace("-EUR","").upper()
             ch5 = get_candle_change(m, "5m")
             if ch5 is not None:
-                arr.append((s, ch5))
+                arr.append((m.replace("-EUR","").upper(), ch5))
         if not arr:
             return [], 0.0, 0.0
         changes = [c for _, c in arr]
         med = statistics.median(changes)
-        p75 = statistics.quantiles(changes, n=4)[2]  # ~75%
-        return sorted(arr, key=lambda x:x[1], reverse=True), med, p75
+        # p75 آمن حتى لو العناصر قليلة
+        if len(changes) >= 4:
+            p75 = statistics.quantiles(changes, n=4)[2]
+        else:
+            # تقريب p75 بسيط لما القائمة قصيرة
+            p75 = sorted(changes)[int(len(changes)*0.75) - 1] if len(changes) > 1 else changes[0]
+        arr.sort(key=lambda x:x[1], reverse=True)
+        return arr, med, p75
     except Exception as e:
         print("❌ bitvavo_markets_changes:", e)
         return [], 0.0, 0.0
-
 def filter_binance_tradables(candidates):
-    """استبعاد الرموز غير القابلة للتداول (UP/DOWN/BULL/BEAR أو غير TRADING أو بدون قيود واضحة)."""
     info = fetch_binance_symbols_cached()
     by_name = {s["symbol"]: s for s in info.get("symbols", [])}
     ok = []
@@ -153,15 +156,7 @@ def filter_binance_tradables(candidates):
         name = s.get("symbol","")
         if any(name.endswith(x) for x in ("UPUSDT","DOWNUSDT","BULLUSDT","BEARUSDT")):
             continue
-        # شرط بسيط على MIN_NOTIONAL/NOTIONAL (يمكن تعقيده عند الحاجة)
-        notional_ok = True
-        for f in s.get("filters", []):
-            if f.get("filterType") in ("MIN_NOTIONAL","NOTIONAL"):
-                mn = float(f.get("minNotional", f.get("notional", "0")))
-                if mn < 0:
-                    notional_ok = False
-        if notional_ok:
-            ok.append(sym)
+        ok.append(sym)  # لا نعقّد الـNOTIONAL هنا
     return ok
 
 def fetch_top_bitvavo_then_match_binance():
@@ -191,8 +186,10 @@ def get_rank_from_bitvavo(coin, *, force_refresh=False):
         sorted_changes = None
         if not force_refresh:
             cached = r.get(RANK_CACHE_ALL)
-            if cached: sorted_changes = json.loads(cached)
+            if cached:
+                sorted_changes = json.loads(cached)
         if sorted_changes is None:
+            # كمل احتياطاً، بس لا تستدعي كثيراً
             sorted_changes, _, _ = bitvavo_markets_changes()
             r.setex(RANK_CACHE_ALL, RANK_CACHE_TTL, json.dumps(sorted_changes))
         for i,(s,_) in enumerate(sorted_changes,1):
@@ -211,14 +208,21 @@ def is_last_1m_green(coin):
     return True
 
 def get_1m_volume(coin):
+    key = f"v1m:{coin.upper()}"
+    cached = r.get(key)
+    if cached:
+        try: 
+            x = json.loads(cached); return x["last"], x["avg5"]
+        except: 
+            pass
     try:
         res = _get(f"https://api.bitvavo.com/v2/{coin.upper()}-EUR/candles?interval=1m&limit=7", timeout=5)
-        if not isinstance(res,list) or len(res)<6: return None,None
+        if not isinstance(res,list) or len(res)<6: return None, None
         last_vol = float(res[-2][5]); avg5 = sum(float(x[5]) for x in res[-7:-2]) / 5.0
+        r.setex(key, 8, json.dumps({"last": last_vol, "avg5": avg5}))
         return last_vol, avg5
     except Exception:
         return None, None
-
 # =========================
 # حسابات من price_history
 # =========================
@@ -276,10 +280,11 @@ def count_higher_lows(history, lookback=120, min_gap=HL_MIN_GAP_SEC, min_diff_pc
 def global_budget_ok():
     now = time.time()
     r.zremrangebyscore(GLOBAL_BUDGET_KEY, 0, now - GLOBAL_BUDGET_WINDOW)
-    r.zadd(GLOBAL_BUDGET_KEY, {str(now): now})
     cnt = r.zcard(GLOBAL_BUDGET_KEY)
-    return cnt <= GLOBAL_BUDGET_MAX
-
+    if cnt >= GLOBAL_BUDGET_MAX:
+        return False
+    r.zadd(GLOBAL_BUDGET_KEY, {str(now): now})
+    return True
 def fail_blacklisted(coin):
     return r.ttl(f"{FAIL_BLACKLIST_PREFIX}{coin}") > 0
 
@@ -340,24 +345,23 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
 # =========================
 # WebSocket مدمج لعدة رموز
 # =========================
-def start_combined_ws(symbols):
+def start_combined_ws(symbols, gen):
     if not symbols:
         return
     stream = "/".join([f"{s.lower()}@trade" for s in symbols])
     url = f"wss://stream.binance.com:9443/stream?streams={stream}"
 
-    # حالة لكل رمز
-    states = {
-        s: {"price_history": deque(), "last_sent": 0.0, "last_send_price": None,
-            "breakout_price": None, "score_hold_start": None}
-        for s in symbols
-    }
+    states = { s: {"price_history": deque(), "last_sent": 0.0, "last_send_price": None,
+                   "breakout_price": None, "score_hold_start": None}
+               for s in symbols }
 
     def reset_score(st):
         st["score_hold_start"] = None
 
     def on_message(ws, message):
-        if r.get(IS_RUNNING_KEY) != b"1":
+        # أغلق إذا GEN تغيّر
+        cur_gen = int(r.get("ws:gen") or b"0")
+        if cur_gen != gen or r.get(IS_RUNNING_KEY) != b"1":
             ws.close(); return
         try:
             payload = json.loads(message)
@@ -494,7 +498,14 @@ def update_symbols_loop():
     while True:
         if r.get(IS_RUNNING_KEY) != b"1": time.sleep(5); continue
         print("🌀 دورة جديدة لجلب التوب...")
-        top_symbols = fetch_top_bitvavo_then_match_binance()
+        # --- جلب الرتب مرة لكل دورة وتخزينها ---
+        sorted_changes, med, p75 = bitvavo_markets_changes()
+        if sorted_changes:
+            r.setex(RANK_CACHE_ALL, RANK_CACHE_TTL, json.dumps(sorted_changes))
+            r.setex("market:breadth:med", 60, str(med))
+            r.setex("market:breadth:p75", 60, str(p75))
+        # ---------------------------------------
+        top_symbols = fetch_top_bitvavo_then_match_binance()  # يستخدم نفس الدالة كما هي
         if not top_symbols:
             send_message("⚠️ لا عملات صالحة في هذه الدورة.")
             time.sleep(SYMBOL_UPDATE_INTERVAL); continue
@@ -502,16 +513,17 @@ def update_symbols_loop():
         for s in top_symbols: r.hset("watchlist", s, now)
         print(f"📡 حدّثنا المراقبة: {len(top_symbols)} رمز.")
         cleanup_old_coins()
-        # حدّث مجموعة WS إن تغيّرت
+        # إدارة GEN للـWS
         coins = r.hkeys("watchlist")
         symbols = sorted({c.decode() for c in coins})
         active = json.loads(r.get(ACTIVE_WS_SET_KEY) or "[]")
         if symbols and symbols != active:
-            # إعادة تشغيل WS مدمج بمجموعة جديدة
             r.set(ACTIVE_WS_SET_KEY, json.dumps(symbols))
-            threading.Thread(target=start_combined_ws, args=(symbols,), daemon=True).start()
+            # زِيادة GEN لإجبار القديم على الإغلاق
+            gen = int(r.get("ws:gen") or b"0") + 1
+            r.set("ws:gen", gen)
+            threading.Thread(target=start_combined_ws, args=(symbols, gen), daemon=True).start()
         time.sleep(SYMBOL_UPDATE_INTERVAL)
-
 def cleanup_old_coins():
     now = time.time()
     for sym, ts in r.hgetall("watchlist").items():
