@@ -216,7 +216,8 @@ def get_1m_volume(coin):
             pass
     try:
         res = _get(f"https://api.bitvavo.com/v2/{coin.upper()}-EUR/candles?interval=1m&limit=7", timeout=5)
-        if not isinstance(res,list) or len(res)<6: return None, None
+        if not isinstance(res, list) or len(res) < 7:
+    return None, None
         last_vol = float(res[-2][5]); avg5 = sum(float(x[5]) for x in res[-7:-2]) / 5.0
         r.setex(key, 8, json.dumps({"last": last_vol, "avg5": avg5}))
         return last_vol, avg5
