@@ -94,32 +94,39 @@ def _get(url, timeout=8):
     except Exception as e:
         print(f"HTTP GET فشل: {url} | {e}")
         return {}
+
 def get_candle_change(market, interval):
     try:
         res = _get(f"https://api.bitvavo.com/v2/{market}/candles?interval={interval}&limit=3")
-        if not isinstance(res, list) or len(res) < 2: return None
+        if not isinstance(res, list) or len(res) < 2:
+            return None
         o, c = float(res[-2][1]), float(res[-2][4])
         return ((c - o) / o) * 100.0
     except Exception as e:
-        print(f"❌ get_candle_change({market},{interval}):", e); return None
+        print(f"❌ get_candle_change({market},{interval}):", e)
+        return None
 
 def fetch_binance_symbols_cached():
     try:
         cached = r.get(BINANCE_INFO_CACHE)
-        if cached: return json.loads(cached)
+        if cached:
+            return json.loads(cached)
         info = _get("https://api.binance.com/api/v3/exchangeInfo", timeout=8)
         r.setex(BINANCE_INFO_CACHE, 600, json.dumps(info))
         return info
     except Exception as e:
-        print("⚠️ exchangeInfo:", e); return {"symbols": []}
+        print("⚠️ exchangeInfo:", e)
+        return {"symbols": []}
 
 def prefer_pair(base, symbols):
     base = base.upper()
     cands = [s for s in symbols if s.get("baseAsset","").upper()==base and s.get("status")=="TRADING"]
-    if not cands: return None
+    if not cands:
+        return None
     for q in ("USDT","EUR","BTC"):
         for s in cands:
-            if s.get("quoteAsset")==q: return s.get("symbol")
+            if s.get("quoteAsset")==q:
+                return s.get("symbol")
     return cands[0].get("symbol")
 
 ALIASES = {}  # لإصلاح أسماء إن لزم
@@ -128,6 +135,8 @@ def bitvavo_markets_changes():
     """يُعيد (sorted_arr, median, p75) حيث sorted_arr = [(SYMBOL, ch5m), ...]"""
     try:
         markets_res = _get("https://api.bitvavo.com/v2/markets", timeout=8)
+        if not isinstance(markets_res, list):
+            return [], 0.0, 0.0
         markets = [m["market"] for m in markets_res if m.get("market","").endswith("-EUR")]
         arr = []
         for m in markets:
@@ -173,18 +182,21 @@ def fetch_top_bitvavo_then_match_binance():
             r.setex("market:breadth:p75", 60, str(p75))
         top_syms = [s for s,_ in sorted_changes[:MAX_TOP_COINS]]
         top_syms = list(dict.fromkeys(top_syms))
-        info = fetch_binance_symbols_cached(); syms = info.get("symbols",[])
+        info = fetch_binance_symbols_cached()
+        syms = info.get("symbols",[])
         matched, not_found = [], []
         for c in top_syms:
             base = ALIASES.get(c, c).upper()
             best = prefer_pair(base, syms)
             (matched.append(best) if best else not_found.append(c))
-        if not_found: r.sadd("not_found_binance", *not_found)
+        if not_found:
+            r.sadd("not_found_binance", *not_found)
         matched = filter_binance_tradables(matched)
         print(f"📊 Bitvavo top → Binance tradables: {matched}")
         return matched
     except Exception as e:
-        print("❌ fetch_top:", e); return []
+        print("❌ fetch_top:", e)
+        return []
 
 def get_rank_from_bitvavo(coin, *, force_refresh=False):
     try:
@@ -197,16 +209,19 @@ def get_rank_from_bitvavo(coin, *, force_refresh=False):
             sorted_changes, _, _ = bitvavo_markets_changes()
             r.setex(RANK_CACHE_ALL, RANK_CACHE_TTL, json.dumps(sorted_changes))
         for i,(s,_) in enumerate(sorted_changes,1):
-            if s == coin.upper(): return i
+            if s == coin.upper():
+                return i
         return None
     except Exception as e:
-        print("⚠️ get_rank:", e); return None
+        print("⚠️ get_rank:", e)
+        return None
 
 def is_last_1m_green(coin):
     try:
         res = _get(f"https://api.bitvavo.com/v2/{coin.upper()}-EUR/candles?interval=1m&limit=2", timeout=5)
         if isinstance(res,list) and len(res)>=2:
-            o = float(res[-2][1]); c = float(res[-2][4]); return c>=o
+            o = float(res[-2][1]); c = float(res[-2][4])
+            return c>=o
     except Exception as e:
         print("⚠️ 1m green:", e)
     return True
@@ -216,14 +231,16 @@ def get_1m_volume(coin):
     cached = r.get(key)
     if cached:
         try:
-            x = json.loads(cached); return x["last"], x["avg5"]
+            x = json.loads(cached)
+            return x["last"], x["avg5"]
         except:
             pass
     try:
         res = _get(f"https://api.bitvavo.com/v2/{coin.upper()}-EUR/candles?interval=1m&limit=7", timeout=5)
         if not isinstance(res, list) or len(res) < 7:
-    return None, None
-        last_vol = float(res[-2][5]); avg5 = sum(float(x[5]) for x in res[-7:-2]) / 5.0
+            return None, None
+        last_vol = float(res[-2][5])
+        avg5 = sum(float(x[5]) for x in res[-7:-2]) / 5.0
         r.setex(key, 8, json.dumps({"last": last_vol, "avg5": avg5}))
         return last_vol, avg5
     except Exception:
@@ -233,9 +250,11 @@ def get_1m_volume(coin):
 # حسابات من price_history
 # =========================
 def std_pct(vals):
-    if not vals: return 0.0
+    if not vals:
+        return 0.0
     m = sum(vals)/len(vals)
-    if m==0: return 0.0
+    if m==0:
+        return 0.0
     var = sum((v-m)**2 for v in vals)/len(vals)
     return (math.sqrt(var)/m)*100.0
 
@@ -246,7 +265,8 @@ def window_vals(history, secs):
 def value_at(history, secs_back):
     now = time.time()
     cand = [(abs((now - t) - secs_back), p) for t,p in history]
-    if not cand: return None
+    if not cand:
+        return None
     return min(cand, key=lambda x:x[0])[1]
 
 def highest_in(history, secs):
@@ -255,7 +275,8 @@ def highest_in(history, secs):
 
 def slope_pct_per_sec(history, secs):
     p_old = value_at(history, secs)
-    if not p_old: return 0.0
+    if not p_old:
+        return 0.0
     p_now = history[-1][1]
     return (((p_now - p_old)/p_old)*100.0)/secs
 
@@ -267,7 +288,8 @@ def accel(history):
 def count_higher_lows(history, lookback=120, min_gap=HL_MIN_GAP_SEC, min_diff_pct=HL_MIN_DIFF_PCT):
     now = time.time()
     pts = [(t,p) for t,p in history if now - t <= lookback]
-    if len(pts) < 5: return 0
+    if len(pts) < 5:
+        return 0
     lows = []
     for i in range(1,len(pts)-1):
         if pts[i-1][1] > pts[i][1] < pts[i+1][1]:
@@ -307,14 +329,17 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
     if last and time.time() - float(last) < ALERT_COOLDOWN_SEC:
         return
     if not global_budget_ok():
-        print("⛔ تجاوزنا ميزانية الإشارات العالمية مؤقتًا."); return
+        print("⛔ تجاوزنا ميزانية الإشارات العالمية مؤقتًا.")
+        return
     if fail_blacklisted(coin):
-        print(f"⛔ {coin} محظورة مؤقتًا بعد دروداون سابق."); return
+        print(f"⛔ {coin} محظورة مؤقتًا بعد دروداون سابق.")
+        return
 
     rank = get_rank_from_bitvavo(coin)  # بدون force_refresh
     max_rank = RANK_MAX if allow_rank_max else RANK_FILTER
     if not rank or rank > max_rank:
-        print(f"⛔ {coin} خارج التوب {max_rank} (rank={rank})."); return
+        print(f"⛔ {coin} خارج التوب {max_rank} (rank={rank}).")
+        return
 
     prev_k, prev_ts_k = f"rank_prev:{coin}", f"rank_prev_ts:{coin}"
     prev = r.get(prev_k); prev = int(prev) if prev else None
@@ -322,10 +347,12 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
     just_entered = (prev is None) or (prev > max_rank and rank <= max_rank)
     improved = (prev is not None) and ((prev - rank) >= IMPROVEMENT_STEPS)
     if not (just_entered or improved):
-        print(f"⛔ {coin} دون تحسّن كافٍ (prev={prev} → now={rank})."); return
+        print(f"⛔ {coin} دون تحسّن كافٍ (prev={prev} → now={rank}).")
+        return
 
     if REQUIRE_LAST_1M_GREEN and not is_last_1m_green(coin):
-        print(f"⛔ {coin} شمعة 1m ليست خضراء."); return
+        print(f"⛔ {coin} شمعة 1m ليست خضراء.")
+        return
 
     v_now, v_avg = get_1m_volume(coin)
     med = float(r.get("market:breadth:med") or "0")
@@ -379,7 +406,8 @@ def start_combined_ws(symbols, gen):
             return
 
         st = states.get(symbol)
-        if not st: return
+        if not st:
+            return
         now = time.time()
         coin = symbol.replace("USDT","").replace("BTC","").replace("EUR","")
 
@@ -387,7 +415,8 @@ def start_combined_ws(symbols, gen):
         ph.append((now, price))
         while ph and now - ph[0][0] > WATCH_DURATION:
             ph.popleft()
-        if len(ph) < 6: return
+        if len(ph) < 6:
+            return
 
         p75 = float(r.get("market:breadth:p75") or "0")
         SCORE_THRESHOLD = BASE_SCORE_THRESHOLD - (1.0 if p75 >= 1.5 else 0.0) + (0.5 if p75 <= 0.1 else 0.0)
@@ -494,7 +523,8 @@ def start_combined_ws(symbols, gen):
 # =========================
 def update_symbols_loop():
     while True:
-        if r.get(IS_RUNNING_KEY) != b"1": time.sleep(5); continue
+        if r.get(IS_RUNNING_KEY) != b"1":
+            time.sleep(5); continue
         print("🌀 دورة جديدة لجلب التوب...")
         sorted_changes, med, p75 = bitvavo_markets_changes()
         if sorted_changes:
@@ -506,7 +536,8 @@ def update_symbols_loop():
             send_message("⚠️ لا عملات صالحة في هذه الدورة.")
             time.sleep(SYMBOL_UPDATE_INTERVAL); continue
         now = time.time()
-        for s in top_symbols: r.hset("watchlist", s, now)
+        for s in top_symbols:
+            r.hset("watchlist", s, now)
         print(f"📡 حدّثنا المراقبة: {len(top_symbols)} رمز.")
         cleanup_old_coins()
         coins = r.hkeys("watchlist")
@@ -533,7 +564,8 @@ def watcher_loop():
     """يحرّك WS أول مرة عند التشغيل."""
     booted = False
     while True:
-        if r.get(IS_RUNNING_KEY) != b"1": time.sleep(5); continue
+        if r.get(IS_RUNNING_KEY) != b"1":
+            time.sleep(5); continue
         if not booted:
             coins = r.hkeys("watchlist")
             symbols = sorted({c.decode() for c in coins})
@@ -569,7 +601,8 @@ def telegram_webhook():
         if coins:
             coin_list = [c.decode().replace("USDT","").replace("BTC","").replace("EUR","") for c in coins]
             msg = ""
-            for i,s in enumerate(coin_list,1): msg += f"{i}. {s}   " + ("\n" if i%5==0 else "")
+            for i,s in enumerate(coin_list,1):
+                msg += f"{i}. {s}   " + ("\n" if i%5==0 else "")
             send_message("📡 العملات المرصودة:\n"+msg.strip())
         else:
             send_message("🚫 لا توجد عملات قيد المراقبة.")
