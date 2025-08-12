@@ -87,8 +87,13 @@ def send_message(text):
         print("فشل إرسال الرسالة:", e)
 
 def _get(url, timeout=8):
-    return requests.get(url, timeout=timeout).json()
-
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"HTTP GET فشل: {url} | {e}")
+        return {}
 def get_candle_change(market, interval):
     try:
         res = _get(f"https://api.bitvavo.com/v2/{market}/candles?interval={interval}&limit=3")
