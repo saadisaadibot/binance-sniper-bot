@@ -511,7 +511,7 @@ def start_combined_ws(symbols, gen):
             time.sleep(2); continue
         try:
             ws = WebSocketApp(url, on_message=on_message)
-            ws.run_forever(ping_interval=20, ping_timeout=10)
+            ws.run_forever(ping_interval=60, ping_timeout=30)
             print(f"[WS] اتصال أغلق. إعادة بعد {backoff}s")
             time.sleep(backoff); backoff = min(backoff*2, 30)
         except Exception as e:
