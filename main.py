@@ -2,7 +2,6 @@
 import os, json, time, math, redis, threading, requests, statistics
 from flask import Flask, request, jsonify
 from websocket import WebSocketApp
-from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 
 # =========================
@@ -69,11 +68,11 @@ app = Flask(__name__)
 r = redis.from_url(REDIS_URL)
 
 # مفاتيح داخلية
-GLOBAL_BUDGET_KEY = "alerts:global_times"           # ZSET timestamps
-BINANCE_INFO_CACHE = "binance:exchangeInfo"
-RANK_CACHE_ALL = "rank_cache:all"
-FAIL_BLACKLIST_PREFIX = "failblk:"                   # failblk:{coin}
-ACTIVE_WS_SET_KEY = "ws:active_set"                  # آخر مجموعة رموز فعلية في WS
+GLOBAL_BUDGET_KEY    = "alerts:global_times"      # ZSET timestamps
+BINANCE_INFO_CACHE   = "binance:exchangeInfo"
+RANK_CACHE_ALL       = "rank_cache:all"
+FAIL_BLACKLIST_PREFIX= "failblk:"                  # failblk:{coin}
+ACTIVE_WS_SET_KEY    = "ws:active_set"            # آخر مجموعة رموز فعلية في WS
 
 # =========================
 # أدوات مساعدة
@@ -118,7 +117,7 @@ def prefer_pair(base, symbols):
             if s.get("quoteAsset")==q: return s.get("symbol")
     return cands[0].get("symbol")
 
-ALIASES = {}  # إن أردت إصلاح أسماء
+ALIASES = {}  # لإصلاح أسماء إن لزم
 
 def bitvavo_markets_changes():
     """يُعيد (sorted_arr, median, p75) حيث sorted_arr = [(SYMBOL, ch5m), ...]"""
@@ -138,13 +137,13 @@ def bitvavo_markets_changes():
         if len(changes) >= 4:
             p75 = statistics.quantiles(changes, n=4)[2]
         else:
-            # تقريب p75 بسيط لما القائمة قصيرة
             p75 = sorted(changes)[int(len(changes)*0.75) - 1] if len(changes) > 1 else changes[0]
         arr.sort(key=lambda x:x[1], reverse=True)
         return arr, med, p75
     except Exception as e:
         print("❌ bitvavo_markets_changes:", e)
         return [], 0.0, 0.0
+
 def filter_binance_tradables(candidates):
     info = fetch_binance_symbols_cached()
     by_name = {s["symbol"]: s for s in info.get("symbols", [])}
@@ -211,9 +210,9 @@ def get_1m_volume(coin):
     key = f"v1m:{coin.upper()}"
     cached = r.get(key)
     if cached:
-        try: 
+        try:
             x = json.loads(cached); return x["last"], x["avg5"]
-        except: 
+        except:
             pass
     try:
         res = _get(f"https://api.bitvavo.com/v2/{coin.upper()}-EUR/candles?interval=1m&limit=7", timeout=5)
@@ -223,6 +222,7 @@ def get_1m_volume(coin):
         return last_vol, avg5
     except Exception:
         return None, None
+
 # =========================
 # حسابات من price_history
 # =========================
@@ -285,6 +285,7 @@ def global_budget_ok():
         return False
     r.zadd(GLOBAL_BUDGET_KEY, {str(now): now})
     return True
+
 def fail_blacklisted(coin):
     return r.ttl(f"{FAIL_BLACKLIST_PREFIX}{coin}") > 0
 
@@ -305,7 +306,7 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
     if fail_blacklisted(coin):
         print(f"⛔ {coin} محظورة مؤقتًا بعد دروداون سابق."); return
 
-    rank = get_rank_from_bitvavo(coin, force_refresh=True)
+    rank = get_rank_from_bitvavo(coin)  # بدون force_refresh
     max_rank = RANK_MAX if allow_rank_max else RANK_FILTER
     if not rank or rank > max_rank:
         print(f"⛔ {coin} خارج التوب {max_rank} (rank={rank})."); return
@@ -328,7 +329,7 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
     p75 = float(r.get("market:breadth:p75") or "0")
     vol_mult = BASE_VOL_SPIKE_MULT - (0.2 if p75 >= 1.0 else 0.0) + (0.2 if p75 <= 0.1 else 0.0)
     if not (v_now and v_avg and v_now >= vol_mult * v_avg):
-        print(f"⛔ {coin} حجم غير كافٍ {v_now}<{vol_mult:.2f}×{v_avg}."); return
+        print(f"⛔ {coin} حجم غير كافٍ {v_now:.2f} < {vol_mult:.2f}×{v_avg:.2f}."); return
 
     r.set(key, time.time())
     msg = f"🚀 {coin} setup مدروس #top{rank}" if not change_text else f"🚀 {coin} {change_text} #top{rank}"
@@ -343,7 +344,7 @@ def notify_buy(coin, tag, change_text=None, *, allow_rank_max=False):
         print("❌ إرسال صقر:", e)
 
 # =========================
-# WebSocket مدمج لعدة رموز
+# WebSocket مدمج لعدة رموز (مع GEN)
 # =========================
 def start_combined_ws(symbols, gen):
     if not symbols:
@@ -359,7 +360,7 @@ def start_combined_ws(symbols, gen):
         st["score_hold_start"] = None
 
     def on_message(ws, message):
-        # أغلق إذا GEN تغيّر
+        # أغلق إذا GEN تغيّر أو التشغيل متوقف
         cur_gen = int(r.get("ws:gen") or b"0")
         if cur_gen != gen or r.get(IS_RUNNING_KEY) != b"1":
             ws.close(); return
@@ -387,7 +388,7 @@ def start_combined_ws(symbols, gen):
         # حرارة السوق لتكييف العتبات
         p75 = float(r.get("market:breadth:p75") or "0")
         SCORE_THRESHOLD = BASE_SCORE_THRESHOLD - (1.0 if p75 >= 1.5 else 0.0) + (0.5 if p75 <= 0.1 else 0.0)
-        HOLD_SECONDS = BASE_HOLD_SECONDS + (1.0 if p75 <= 0.0 else 0.0)
+        HOLD_SECONDS  = BASE_HOLD_SECONDS + (1.0 if p75 <= 0.0 else 0.0)
 
         # ============= نظام النقاط =============
         S = 0
@@ -414,7 +415,7 @@ def start_combined_ws(symbols, gen):
                 S += 2; details.append("SQ")
 
         # 3) ميل/تسارع + منع blow-off
-        a = slope_pct_per_sec(ph, 5) - slope_pct_per_sec(ph, 15)
+        a  = slope_pct_per_sec(ph, 5) - slope_pct_per_sec(ph, 15)
         s5 = slope_pct_per_sec(ph, 5)
         if s5 >= MIN_SLOPE_PCT_PER_SEC:
             S += 1; details.append("S5")
@@ -429,7 +430,7 @@ def start_combined_ws(symbols, gen):
 
         # 5/6) ترتيب + حجم (نؤجّل حتى شبه تأكيد)
         if S >= (SCORE_THRESHOLD - 2):
-            rank_now = get_rank_from_bitvavo(coin, force_refresh=True)
+            rank_now = get_rank_from_bitvavo(coin)  # بدون force_refresh
             v_now, v_avg = get_1m_volume(coin)
             vol_mult = BASE_VOL_SPIKE_MULT - (0.2 if p75 >= 1.0 else 0.0) + (0.2 if p75 <= 0.1 else 0.0)
             if rank_now and rank_now <= RANK_MAX and v_now and v_avg and v_now >= vol_mult*v_avg:
@@ -524,6 +525,7 @@ def update_symbols_loop():
             r.set("ws:gen", gen)
             threading.Thread(target=start_combined_ws, args=(symbols, gen), daemon=True).start()
         time.sleep(SYMBOL_UPDATE_INTERVAL)
+
 def cleanup_old_coins():
     now = time.time()
     for sym, ts in r.hgetall("watchlist").items():
@@ -544,7 +546,9 @@ def watcher_loop():
             symbols = sorted({c.decode() for c in coins})
             if symbols:
                 r.set(ACTIVE_WS_SET_KEY, json.dumps(symbols))
-                threading.Thread(target=start_combined_ws, args=(symbols,), daemon=True).start()
+                gen = int(r.get("ws:gen") or b"0") + 1
+                r.set("ws:gen", gen)
+                threading.Thread(target=start_combined_ws, args=(symbols, gen), daemon=True).start()
                 booted = True
         time.sleep(2)
 
@@ -580,6 +584,7 @@ def telegram_webhook():
         r.delete("watchlist"); r.delete(RANK_CACHE_ALL); r.delete(GLOBAL_BUDGET_KEY)
         for k in r.scan_iter("postsend:watch:*"): r.delete(k)
         r.delete(ACTIVE_WS_SET_KEY)
+        r.incr("ws:gen")  # إجبار كل WS على الإغلاق فوراً
         send_message("🧹 مسحنا الذاكرة. ستُحدَّث القوائم بالدورة القادمة.")
     return jsonify(ok=True)
 
