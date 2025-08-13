@@ -159,8 +159,10 @@ def once_cycle():
 
     # اختيار Top N حسب r5m فقط، مع فلتر سيولة
     ranked = sorted(
-        (m, f) for m,f in feats.items() if f["liq_rank"] <= LIQ_RANK_MAX
-    , key=lambda kv: kv[1]["r5m"], reverse=True)
+        ((m, f) for m, f in feats.items() if f["liq_rank"] <= LIQ_RANK_MAX),
+        key=lambda kv: kv[1]["r5m"],
+        reverse=True
+    )
 
     picked = ranked[:TOP_N_5M]
 
