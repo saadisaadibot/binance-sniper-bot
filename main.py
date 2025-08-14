@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bot A — Top5m Hunter (with preburst tagging)
-- يجمع أسواق -EUR، يحسب r5m/r10m/volZ
-- يأخذ Top 10 حسب r5m فقط
-- يرسل CV لـ B ويتضمن مؤشرات قاعدة ضيقة (preburst)
+Bot A — Top5m (Cleaner Hybrid)
+- الأساس: ترتيب حسب r5m فقط (كما في النسخة القديمة)
+- فلتر خفيف قبل الإرسال:
+    * استبعاد volZ < VOLZ_MIN (افتراضي -1.0)
+    * قبول فقط ما لديه حركة معقولة: r5m>=MIN_R_BUMP أو r10m>=MIN_R_BUMP (افتراضي 0.3%)
+- يرسل CV إلى Bot B مع مؤشرات preburst/اختراق 5bp
+- يحتفظ بنقاط السيولة والباتشات للحفاظ على الكفاءة
 """
 
 import os, time, math, random, threading
@@ -11,27 +14,33 @@ import requests
 from flask import Flask, jsonify
 
 # =========================
-# إعدادات
+# إعدادات قابلة للتعديل
 # =========================
-BITVAVO_URL   = "https://api.bitvavo.com"
-HTTP_TIMEOUT  = 8.0
+BITVAVO_URL    = "https://api.bitvavo.com"
+HTTP_TIMEOUT   = 8.0
 
-CYCLE_SEC     = 180
-TOP_N_5M      = 10
-MARKET_SUFFIX = "-EUR"
-LIQ_RANK_MAX  = 200
+CYCLE_SEC      = 180
+TOP_N_5M       = 10
+MARKET_SUFFIX  = "-EUR"
+LIQ_RANK_MAX   = 200
 
-B_INGEST_URL  = "https://express-bitv.up.railway.app/ingest"
-SEND_TIMEOUT  = 6.0
+# وجهة Bot B (يمكن تمريرها من البيئة)
+B_INGEST_URL   = os.getenv("B_INGEST_URL", "https://express-bitv.up.railway.app/ingest")
+SEND_TIMEOUT   = 6.0
 
-BATCH_SIZE    = 10
-BATCH_SLEEP   = 0.35
+# باتشات
+BATCH_SIZE     = 10
+BATCH_SLEEP    = 0.35
+
+# فلترة “هجينة نظيفة”
+VOLZ_MIN       = float(os.getenv("VOLZ_MIN", "-1.0"))   # استبعاد ما دون هذا
+MIN_R_BUMP     = float(os.getenv("MIN_R_BUMP", "0.3"))  # ٪: r5m أو r10m يجب أن يبلغ على الأقل هذا الحد
 
 # =========================
 # HTTP
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent": "Top5m-Hunter/2.0"})
+session.headers.update({"User-Agent": "Top5m-Hybrid/1.0"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -104,7 +113,7 @@ def feat_from_candles(cnd):
     sigma  = math.sqrt(sum((v-mu)**2 for v in base)/len(base)) if base else 0.0
     volZ   = zscore(vols[-1] if vols else 0.0, mu, sigma)
 
-    # قياس انضغاط آخر 10 دقائق + اختراق بسيط
+    # انضغاط آخر 10 دقائق + اختراق بسيط (0.05%)
     def range_pct(arr):
         lo, hi = min(arr), max(arr)
         return (hi - lo) / ((hi+lo)/2) * 100.0 if hi>0 and lo>0 else 0.0
@@ -116,7 +125,7 @@ def feat_from_candles(cnd):
     return r5m, r10m, volZ, closes, rng10, preburst, breakout5bp
 
 # =========================
-# دورة الصيد
+# دورة الصيد (Top5m + فلتر نظيف)
 # =========================
 def once_cycle():
     load_markets()
@@ -143,29 +152,35 @@ def once_cycle():
     for batch in chunks(pool, BATCH_SIZE):
         for p in batch:
             m = p["market"]
+            if p["liq_rank"] > LIQ_RANK_MAX: 
+                continue
             cnd = read_candles_1m(m, limit)
-            if not cnd: continue
+            if not cnd: 
+                continue
             r5m, r10m, volZ, closes, rng10, preburst, brk5bp = feat_from_candles(cnd)
+
+            # فلتر “الهجين النظيف”
+            if volZ < VOLZ_MIN:
+                continue
+            if not (r5m >= MIN_R_BUMP or r10m >= MIN_R_BUMP):
+                continue
+
             feats[m] = {
                 "symbol": p["symbol"],
                 "r5m": round(r5m, 4),
                 "r10m": round(r10m, 4),
                 "volZ": round(volZ, 4),
                 "liq_rank": p["liq_rank"],
-                "price_now": closes[-1],
-                "price_5m_ago": closes[-6] if len(closes) > 6 else closes[0],
+                "price_now": float(closes[-1]),
+                "price_5m_ago": float(closes[-6] if len(closes) > 6 else closes[0]),
                 "range10": round(rng10, 3),
                 "preburst": bool(preburst),
                 "brk5bp": bool(brk5bp),
             }
         time.sleep(BATCH_SLEEP)
 
-    ranked = sorted(
-        ((m, f) for m, f in feats.items() if f["liq_rank"] <= LIQ_RANK_MAX),
-        key=lambda kv: kv[1]["r5m"],
-        reverse=True
-    )
-
+    # ترتيب نهائي حسب r5m فقط (كما في نسختك القديمة)
+    ranked = sorted(feats.items(), key=lambda kv: kv[1]["r5m"], reverse=True)
     picked = ranked[:TOP_N_5M]
 
     sent = 0
@@ -185,13 +200,14 @@ def once_cycle():
                 "preburst": f["preburst"],
                 "brk5bp": f["brk5bp"],
             },
-            "tags": ["top5m"],
+            "tags": ["top5m:hybrid-clean"],
             "ttl_sec": 1800
         }
         if http_post(B_INGEST_URL, cv):
             sent += 1
 
-    print(f"[CYCLE] Sent {sent}/{TOP_N_5M} top5m coins to B")
+    print(f"[CYCLE] Sent {sent}/{TOP_N_5M} to B "
+          f"(filters: volZ≥{VOLZ_MIN}, r≥{MIN_R_BUMP}%)")
 
 # =========================
 # تشغيل دوري + Flask
@@ -205,7 +221,7 @@ def loop_runner():
 app = Flask(__name__)
 
 @app.route("/")
-def root(): return "Top5m Hunter A is alive ✅"
+def root(): return "Top5m Hybrid A is alive ✅"
 
 @app.route("/once")
 def once(): 
