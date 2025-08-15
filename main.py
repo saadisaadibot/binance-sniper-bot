@@ -34,7 +34,7 @@ BATCH_SIZE     = int(os.getenv("BATCH_SIZE", "8"))
 BATCH_SLEEP    = float(os.getenv("BATCH_SLEEP", "0.50"))
 
 # فلترة “هجينة نظيفة” (نهائية بعد الدمج) — مخففة
-VOLZ_MIN       = float(os.getenv("VOLZ_MIN", "-0.5"))    # استبعد السيولة الضعيفة جداً
+VOLZ_MIN       = float(os.getenv("VOLZ_MIN", "-1.0"))    # استبعد السيولة الضعيفة جداً
 MIN_R_BUMP     = float(os.getenv("MIN_R_BUMP", "0.15"))  # ٪: r5m أو r10m حد أدنى خفيف
 ALLOW_PRE_PASS = os.getenv("ALLOW_PRE_PASS", "1") == "1" # مرّر preburst/brk5bp بسيولة ≥ -0.3
 
