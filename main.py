@@ -167,10 +167,17 @@ def once_cycle():
     if not tick:
         print("0/0"); return
 
+    # ——— إعدادات محلية لهذا النمط ———
+    NO_FILTER_MODE = True      # 👈 وضع بدون فلترة
+    K5 = 5                    # Top 5 من كل سلة
+    CAP_MAX = 18              # سقف نهائي للإرسال (5+5+5=15 عادةً، احتياط 18)
+
+    # بناء تجمع السيولة
     pool = []
     for it in tick:
         m = norm_market(it.get("market", ""))
-        if m not in SUPPORTED: continue
+        if m not in SUPPORTED: 
+            continue
         last = float(it.get("last", 0.0) or 0.0)
         vol  = float(it.get("volume", 0.0) or 0.0)
         eur_vol = last * vol
@@ -180,20 +187,17 @@ def once_cycle():
     for rank, p in enumerate(pool, 1):
         p["liq_rank"] = rank
 
+    # حساب الميزات
     feats = {}
     limit = 12
-    scanned = 0
-    ok_candles = 0
-
     for batch in chunks(pool, BATCH_SIZE):
         for p in batch:
-            m = p["market"]
             if p["liq_rank"] > LIQ_RANK_MAX:
                 continue
+            m = p["market"]
             cnd = read_candles_1m(m, limit)
             if not cnd:
                 continue
-            ok_candles += 1
             f = feat_from_candles(cnd)
             if not f:
                 continue
@@ -202,58 +206,41 @@ def once_cycle():
                 "liq_rank": p["liq_rank"],
                 **{k: (round(v,4) if isinstance(v,float) else v) for k,v in f.items()}
             }
-            scanned += 1
         time.sleep(BATCH_SLEEP)
 
     if not feats:
-        print("0/0")
-        return
+        print("0/0"); return
 
-    # --- 1) Top by 5m
-    top5m = sorted(feats.items(), key=lambda kv: kv[1]["r5m"], reverse=True)[:TOP_N_5M]
+    # --- سلال بدون شروط ---
+    top5m  = sorted(feats.items(), key=lambda kv: kv[1]["r5m"],  reverse=True)[:K5]
+    top10m = sorted(feats.items(), key=lambda kv: kv[1]["r10m"], reverse=True)[:K5]
+    pre    = [kv for kv in feats.items() if kv[1].get("preburst") or kv[1].get("brk5bp")]
+    pre    = sorted(pre, key=lambda kv: (kv[1]["preburst"], kv[1]["brk5bp"], kv[1]["r5m"], kv[1]["r10m"]), reverse=True)[:K5]
 
-    # --- 2) Top by 10m
-    top10m = sorted(feats.items(), key=lambda kv: kv[1]["r10m"], reverse=True)[:TOP_N_10M]
-
-    # --- 3) Preburst/Breakout 5bp
-    pre = [kv for kv in feats.items() if kv[1].get("preburst") or kv[1].get("brk5bp")]
-    pre = sorted(pre, key=lambda kv: (kv[1]["preburst"], kv[1]["brk5bp"], kv[1]["r5m"], kv[1]["r10m"]), reverse=True)[:TOP_N_PRE]
-
-    # دمج + إزالة تكرار
+    # دمج + إزالة تكرار (أولوية ظهور: r5m ثم r10m ثم pre)
     merged = {}
     for group in (top5m, top10m, pre):
         for m, f in group:
-            merged[m] = f
+            if m not in merged:
+                merged[m] = f
+
     candidates = list(merged.items())
-    before_cnt = len(candidates)
+    cand_cnt = len(candidates)
+    if cand_cnt == 0:
+        print("0/0"); return
 
-    # فلتر نهائي مخفف
-    final = []
-    for m, f in candidates:
-        r5 = f["r5m"]; r10 = f["r10m"]; vz = f["volZ"]
-        if (r5 >= MIN_R_BUMP) or (r10 >= MIN_R_BUMP):
-            final.append((m, f)); continue
-        if ALLOW_PRE_PASS and (f.get("preburst") or f.get("brk5bp")) and vz >= -0.3:
-            final.append((m, f)); continue
-        if vz < VOLZ_MIN:
-            continue
-
-    after_cnt = len(final)
-    if after_cnt == 0:
-        print(f"{before_cnt}/0")
-        return
-
-    # ترتيب الإرسال — r5m ثم r10m ثم volZ
+    # ترتيب عام لطيف (يحافظ على روح r5m أولاً)
     final_sorted = sorted(
-        final,
-        key=lambda kv: (kv[1]["r5m"], kv[1]["r10m"], kv[1]["volZ"]),
+        candidates,
+        key=lambda kv: (kv[1]["r5m"], kv[1]["r10m"], kv[1].get("volZ", 0.0)),
         reverse=True
     )
 
-    # سقف العدد المرسل
-    cap = max(TOP_N_5M, min(16, TOP_N_5M + TOP_N_10M//2))
+    # سقف إرسال نهائي
+    cap = min(CAP_MAX, len(final_sorted))
     picked = final_sorted[:cap]
 
+    # إرسال إلى Bot B
     sent = 0
     now_ts = int(time.time())
     for m, f in picked:
@@ -264,23 +251,23 @@ def once_cycle():
             "feat": {
                 "r5m": float(f["r5m"]),
                 "r10m": float(f["r10m"]),
-                "volZ": float(f["volZ"]),
+                "volZ": float(f.get("volZ", 0.0)),
                 "price_now": float(f["price_now"]),
                 "price_5m_ago": float(f["price_5m_ago"]),
                 "liq_rank": int(f["liq_rank"]),
-                "range10": float(f["range10"]),
-                "preburst": bool(f["preburst"]),
-                "brk5bp": bool(f["brk5bp"]),
+                "range10": float(f.get("range10", 0.0)),
+                "preburst": bool(f.get("preburst", False)),
+                "brk5bp": bool(f.get("brk5bp", False)),
             },
-            "tags": ["top:hybrid", "src:bitvavo:1m"],
+            "tags": ["top:nofilter", "src:bitvavo:1m"],
             "ttl_sec": 1800
         }
         if http_post(B_INGEST_URL, cv):
             sent += 1
-        time.sleep(0.05)  # خيط صغير لمنع ضغط B
+        time.sleep(0.05)  # خيط صغير بين الإرسالات
 
-    # الطباعة المطلوبة: قبل/بعد فقط
-    print(f"{before_cnt}/{after_cnt}")
+    # طباعة مختصرة: عدد المرشحين بعد الدمج / عدد المرسَلين
+    print(f"{cand_cnt}/{sent}")
 
 # =========================
 # تشغيل دوري + Flask
