@@ -167,7 +167,7 @@ def once_cycle():
 
     tick = http_get("/v2/ticker/24h")
     if not tick:
-        print("[CYCLE] /ticker/24h failed"); return
+        print("0/0"); return  # فشل جلب البيانات
 
     pool = []
     for it in tick:
@@ -208,7 +208,8 @@ def once_cycle():
         time.sleep(BATCH_SLEEP)
 
     if not feats:
-        print(f"[CYCLE] markets≤{LIQ_RANK_MAX}  ok_candles={ok_candles}  feats=0 — (warmup/429 likely)")
+        # ما في مرشحين أساسًا → قبل/بعد = 0/0
+        print("0/0")
         return
 
     # --- 1) Top by 5m
@@ -227,6 +228,7 @@ def once_cycle():
         for m, f in group:
             merged[m] = f
     candidates = list(merged.items())
+    before_cnt = len(candidates)
 
     # فلتر نهائي نظيف
     final = []
@@ -238,8 +240,10 @@ def once_cycle():
         elif ALLOW_PRE_PASS and (f["preburst"] or f["brk5bp"]) and f["volZ"] >= 0.0:
             final.append((m, f))
 
-    if not final:
-        print(f"[CYCLE] scanned={scanned}  cand={len(candidates)}  final=0 (VOLZ_MIN={VOLZ_MIN}, MIN_R_BUMP={MIN_R_BUMP}%)")
+    after_cnt = len(final)
+    if after_cnt == 0:
+        # اطبع فقط الرقمين وارجع
+        print(f"{before_cnt}/0")
         return
 
     # ترتيب الإرسال — r5m ثم r10m ثم volZ
@@ -276,12 +280,10 @@ def once_cycle():
         }
         if http_post(B_INGEST_URL, cv):
             sent += 1
-        time.sleep(0.05)  # خيط صغير بين الإرسال لمنع ضغط B
+        time.sleep(0.05)
 
-    print(f"[CYCLE] markets≤{LIQ_RANK_MAX}  ok_candles={ok_candles}  feats={len(feats)}  "
-          f"cand={len(candidates)}  final={len(final)}  sent={sent}/{cap}  "
-          f"(VOLZ_MIN={VOLZ_MIN}, MIN_R_BUMP={MIN_R_BUMP}%)")
-
+    # السطر المطلوب: قبل/بعد فقط
+    print(f"{before_cnt}/{after_cnt}")
 # =========================
 # تشغيل دوري + Flask
 # =========================
