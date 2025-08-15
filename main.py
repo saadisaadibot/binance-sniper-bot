@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Bot A — 3-minute Snapshot Collector (no rolling storage, no .env)
-- كل 3 دقائق:
-  * يجلب آخر 3 شموع 1m مباشرةً من Bitvavo لكل أسواق -EUR
-  * يحسب r3m% (آخر إغلاق مقابل أول إغلاق داخل 3m)
-  * يرتب نزولياً ويختار Top10
-  * يرسل بايلود كامل إلى Bot B عبر B_INGEST_URL (مع السلسلة كاملة [(ts, close), ...])
-
-Endpoints:
-- GET /health   → حالة سريعة
-- GET /preview  → آخر بايلود محسوب (بدون إرسال)
-
-يشغَّل على Railway عبر gunicorn:
-  gunicorn -w 1 -b 0.0.0.0:$PORT 'main:app'
-"""
-
 import time
 import threading
 from collections import namedtuple
@@ -25,26 +9,21 @@ import requests
 from flask import Flask, jsonify
 
 # =========================
-# 🔧 إعدادات ثابتة (بدون .env)
+# 🔧 إعدادات ثابتة
 # =========================
 BITVAVO_URL        = "https://api.bitvavo.com"
 HTTP_TIMEOUT       = 8.0
 RETRIES            = 3
 BACKOFF_BASE_SEC   = 0.6
 
-ONLY_EUR_MARKETS   = 1            # 1 = أسواق -EUR فقط
-MAX_THREADS        = 32           # خيوط جلب الشموع
-COLLECT_EVERY_SEC  = 180          # كل 3 دقائق
+ONLY_EUR_MARKETS   = 1
+MAX_THREADS        = 32
+COLLECT_EVERY_SEC  = 180
 TOP_N              = 10
 
-# وجهة الإرسال لبوت B (ثابتة)
 B_INGEST_URL       = "https://express-bitv.up.railway.app/ingest"
-
-# شموع 1m بعدد 3 لتغطية ~3 دقائق
 CANDLE_INTERVAL    = "1m"
 CANDLE_LIMIT       = 3
-
-# مدة كاش لقائمة الأسواق (ثوانٍ)
 MARKETS_CACHE_TTL  = 3600
 
 # =========================
@@ -89,7 +68,7 @@ def http_post(url, json_body):
     return False, err
 
 # =========================
-# 📋 جلب قائمة أسواق -EUR
+# 📋 أسواق EUR
 # =========================
 def get_supported_eur_markets():
     now = time.time()
@@ -114,21 +93,18 @@ def get_supported_eur_markets():
     return markets
 
 # =========================
-# 🔎 حساب r3m من شموع 1m × 3
+# 🔎 r3m من 3 شموع 1m
 # =========================
 Result = namedtuple("Result", ["market", "r3m", "last", "series"])
 
 def fetch_r3m_for_market(market: str):
-    # Bitvavo: /candles?market=ADA-EUR&interval=1m&limit=3
     params = {"market": market, "interval": CANDLE_INTERVAL, "limit": CANDLE_LIMIT}
     data = http_get(f"{BITVAVO_URL}/candles", params=params)
-    # شكل الاستجابة: [[ts_ms, open, high, low, close, volume], ...]
     if not isinstance(data, list) or len(data) < 2:
         return None
 
     rows = data[-CANDLE_LIMIT:]
-    series = []
-    closes = []
+    series, closes = [], []
     for row in rows:
         try:
             ts_ms, _o, _h, _l, c, _v = row
@@ -158,7 +134,6 @@ def collector_loop():
 
         markets = get_supported_eur_markets()
         results = []
-
         if markets:
             with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
                 futures = {ex.submit(fetch_r3m_for_market, m): m for m in markets}
@@ -170,7 +145,6 @@ def collector_loop():
                     except Exception:
                         pass
 
-        # ترتيب وأخذ TopN
         results.sort(key=lambda r: r.r3m, reverse=True)
         top = results[:TOP_N]
 
@@ -201,13 +175,11 @@ def collector_loop():
         else:
             print("[BotA] B_INGEST_URL not set — skipping push")
 
-        # نوم للدورة التالية
         elapsed = time.time() - start
-        sleep_for = max(0.0, COLLECT_EVERY_SEC - elapsed)
-        time.sleep(sleep_for)
+        time.sleep(max(0.0, COLLECT_EVERY_SEC - elapsed))
 
 # =========================
-# 🌐 واجهات مساعدة
+# 🌐 واجهات
 # =========================
 @app.get("/health")
 def health():
@@ -226,11 +198,11 @@ def preview():
         return jsonify(_last_payload), 200
 
 # =========================
-# ▶️ التشغيل
+# ▶️ التشغيل (لـ gunicorn)
 # =========================
 def start_threads():
     th = threading.Thread(target=collector_loop, name="collector", daemon=True)
     th.start()
 
 start_threads()
-# ملاحظة: لا تستخدم app.run() على Railway؛ استخدم gunicorn كما في التعليق أعلى الملف.
+# لا app.run() هنا. سيتم تشغيل Flask عبر gunicorn كما في Procfile.
