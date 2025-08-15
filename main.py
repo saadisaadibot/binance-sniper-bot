@@ -1,18 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Bot A — 3-minute Snapshot Collector (Expanded, no .env, single file)
-- Every 3 minutes on the exact 3m boundary (UTC): fetch last 3×1m candles for all -EUR markets
-- Compute r3m% (close_last vs close_first), sort desc, pick Top10
-- POST payload (with full [(ts, close)] series) to Bot B
-- Rich logging + health endpoints
-
-Run on Railway:
-  Start Command → python main.py
+Bot A — 3-minute Snapshot Collector (Expanded, no .env, single file, Bitvavo v2)
+- كل 3 دقائق على الحدّ: يجلب آخر 3 شموع 1m لكل أسواق -EUR من Bitvavo /v2
+- يحسب r3m%، يرتّب تنازليًا، يرسل Top10 مع السلسلة الكاملة [(ts, close)] إلى Bot B
+- يشغّل مباشرةً على Railway بأمر: python main.py
 """
 
 import os
 import time
-import math
 import json
 import threading
 from collections import namedtuple
@@ -25,28 +20,25 @@ from flask import Flask, jsonify
 # =========================
 # ⚙️ ثابتات (بدون .env)
 # =========================
-BITVAVO_URL         = "https://api.bitvavo.com"
+BITVAVO_URL         = "https://api.bitvavo.com/v2"  # ✅ استخدم v2 لتفادي 404
 HTTP_TIMEOUT_SEC    = 8.0
 HTTP_RETRIES        = 3
-HTTP_BACKOFF_BASE   = 0.6     # ثواني
+HTTP_BACKOFF_BASE   = 0.6
 
-ONLY_EUR_MARKETS    = 1       # 1 = أسواق -EUR فقط
-MAX_THREADS         = 40      # خيوط جلب الشموع (يُضبط تلقائياً إذا الأسواق قليلة)
-THREAD_CHUNK_SLEEP  = 0.0     # نوم بسيط بين دفعات المستقبلات (لطف على API)
-
-CYCLE_SEC           = 180     # كل 3 دقائق
+ONLY_EUR_MARKETS    = 1
+MAX_THREADS         = 40
+CYCLE_SEC           = 180      # كل 3 دقائق
 TOP_N               = 10
 CANDLE_INTERVAL     = "1m"
-CANDLE_LIMIT        = 3       # آخر 3 دقائق ≈ 3 شموع دقيقة
+CANDLE_LIMIT        = 3        # آخر 3 دقائق ≈ 3 شموع
 
 # وجهة الإرسال لبوت B
 B_INGEST_URL        = "https://express-bitv.up.railway.app/ingest"
 SEND_TIMEOUT_SEC    = 8.0
 
 # كاش قائمة الأسواق
-MARKETS_CACHE_TTL   = 3600    # ثواني
+MARKETS_CACHE_TTL   = 3600
 
-# طباعة لوج كل كم عملية إرسال
 LOG_PREFIX          = "[BotA]"
 
 # =========================
@@ -65,27 +57,18 @@ _last_error    = None
 _lock          = threading.Lock()
 
 # =========================
-# 🧰 أدوات عامة
+# 🧰 أدوات
 # =========================
 def log(msg):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"{LOG_PREFIX} {ts} | {msg}", flush=True)
 
-def sleep_s(seconds: float):
-    if seconds > 0:
-        time.sleep(seconds)
-
 def to_iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 def align_to_next_3m(now: float) -> float:
-    """يعيد زمن النوم المطلوب للحد 3 دقائق التالي (UTC)."""
-    # مثال: 12:00:00, 12:03:00, 12:06:00, ...
-    secs = int(now)
-    remainder = secs % CYCLE_SEC
-    wait = CYCLE_SEC - remainder if remainder else 0
-    # احتياط صغير لبدء بعد الحد بثانية
-    return wait if wait > 0 else CYCLE_SEC
+    remainder = int(now) % CYCLE_SEC
+    return CYCLE_SEC - remainder if remainder else CYCLE_SEC
 
 # =========================
 # 🌐 HTTP مع Retry
@@ -100,7 +83,7 @@ def http_get(url, params=None, timeout=HTTP_TIMEOUT_SEC):
             err = f"status={r.status_code} body={r.text[:200]}"
         except Exception as e:
             err = str(e)
-        sleep_s(HTTP_BACKOFF_BASE * attempt)
+        time.sleep(HTTP_BACKOFF_BASE * attempt)
     raise RuntimeError(f"GET {url} failed after {HTTP_RETRIES} attempts: {err}")
 
 def http_post(url, payload, timeout=SEND_TIMEOUT_SEC):
@@ -113,7 +96,7 @@ def http_post(url, payload, timeout=SEND_TIMEOUT_SEC):
             err = f"status={r.status_code} body={r.text[:200]}"
         except Exception as e:
             err = str(e)
-        sleep_s(HTTP_BACKOFF_BASE * attempt)
+        time.sleep(HTTP_BACKOFF_BASE * attempt)
     return False, err
 
 # =========================
@@ -123,6 +106,8 @@ def get_supported_eur_markets():
     now = time.time()
     if (now - _markets_cache["ts"]) < MARKETS_CACHE_TTL and _markets_cache["markets"]:
         return list(_markets_cache["markets"])
+
+    # ✅ v2
     data = http_get(f"{BITVAVO_URL}/markets")
     markets = []
     if isinstance(data, list):
@@ -134,6 +119,7 @@ def get_supported_eur_markets():
             if ONLY_EUR_MARKETS and not market.endswith("-EUR"):
                 continue
             markets.append(market)
+
     markets = sorted(set(markets))
     _markets_cache["ts"] = now
     _markets_cache["markets"] = markets
@@ -146,13 +132,17 @@ def get_supported_eur_markets():
 Result = namedtuple("Result", ["market", "r3m", "last", "series"])
 
 def fetch_r3m_for_market(market: str):
-    """يجلب /candles?interval=1m&limit=3 → يحسب r3m% ويعيد السلسلة [(ts, close)]"""
+    """يجلب /v2/{market}/candles?interval=1m&limit=3 → r3m% + series"""
     try:
-        data = http_get(f"{BITVAVO_URL}/candles", params={"market": market, "interval": CANDLE_INTERVAL, "limit": CANDLE_LIMIT})
+        data = http_get(
+            f"{BITVAVO_URL}/{market}/candles",
+            params={"interval": CANDLE_INTERVAL, "limit": CANDLE_LIMIT},
+        )
     except Exception as e:
         log(f"candles fail {market}: {e}")
         return None
 
+    # شكل الاستجابة: [[ts_ms, open, high, low, close, volume], ...]
     if not isinstance(data, list) or len(data) < 2:
         return None
 
@@ -177,7 +167,7 @@ def fetch_r3m_for_market(market: str):
     return Result(market=market, r3m=r3m, last=last_close, series=series)
 
 # =========================
-# 🧮 دورة واحدة (جمع ← ترتيب ← إرسال)
+# 🧮 دورة واحدة
 # =========================
 def collect_once():
     global _last_payload, _last_push_ts, _last_error
@@ -189,26 +179,20 @@ def collect_once():
         if not markets:
             raise RuntimeError("no EUR markets detected")
 
-        # اضبط عدد الخيوط بحيث لا يتجاوز عدد الأسواق
         workers = max(4, min(MAX_THREADS, len(markets)))
-        results = []
-        failures = 0
+        results, failures = [], 0
 
         log(f"Collect start @ {t0_iso} | markets={len(markets)} | workers={workers}")
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {ex.submit(fetch_r3m_for_market, m): m for m in markets}
-            for i, fut in enumerate(as_completed(futures), 1):
+            for fut in as_completed(futures):
                 res = fut.result()
                 if isinstance(res, Result):
                     results.append(res)
                 else:
                     failures += 1
-                # throttle خفيف بين دفعات طويلة (اختياري)
-                if THREAD_CHUNK_SLEEP and (i % 100 == 0):
-                    sleep_s(THREAD_CHUNK_SLEEP)
 
-        # ترتيب وأخذ TopN
         results.sort(key=lambda r: r.r3m, reverse=True)
         top = results[:TOP_N]
 
@@ -223,22 +207,21 @@ def collect_once():
                     "market": r.market,
                     "r3m": round(r.r3m, 5),
                     "last": r.last,
-                    "series": [(ts, float(px)) for (ts, px) in r.series]
+                    "series": [(ts, float(px)) for (ts, px) in r.series],
                 } for r in top
             ],
             "meta": {
                 "markets_total": len(markets),
                 "results_ok": len(results),
                 "results_fail": failures,
-                "duration_sec": round(time.time() - t0, 3)
-            }
+                "duration_sec": round(time.time() - t0, 3),
+            },
         }
 
         with _lock:
             _last_payload = payload
             _last_error = None
 
-        # إرسال
         if B_INGEST_URL:
             ok, msg = http_post(B_INGEST_URL, payload)
             _last_push_ts = time.time()
@@ -261,16 +244,14 @@ def collect_once():
 # 🔁 الجدولة الدورية (حدود 3 دقائق)
 # =========================
 def scheduler_loop():
-    # تشغيل أول فوري لتعبئة /preview بسرعة
     try:
-        collect_once()
+        collect_once()  # تشغيل فوري أول مرّة
     except Exception as e:
         log(f"scheduler first run error: {e}")
 
     while True:
         wait = align_to_next_3m(time.time())
-        # ترك 1.0 ثانية تأخير بسيط بعد الحد لضمان توفر الشمعة الأخيرة
-        sleep_s(wait + 1.0)
+        time.sleep(wait + 1.0)  # هامش 1s بعد الحد لضمان توافر الشمعة الأخيرة
         collect_once()
 
 # =========================
@@ -289,7 +270,7 @@ def health():
             "last_push_iso": to_iso(_last_push_ts) if _last_push_ts else None,
             "top_ready": bool(_last_payload),
             "markets_cached": len(_markets_cache.get("markets", [])),
-            "last_error": _last_error
+            "last_error": _last_error,
         }), 200
 
 @app.get("/preview")
@@ -297,46 +278,20 @@ def preview():
     with _lock:
         return jsonify(_last_payload or {"note": "no payload yet"}), 200
 
-@app.get("/config")
-def config():
-    cfg = {
-        "BITVAVO_URL": BITVAVO_URL,
-        "ONLY_EUR_MARKETS": ONLY_EUR_MARKETS,
-        "CYCLE_SEC": CYCLE_SEC,
-        "CANDLE_INTERVAL": CANDLE_INTERVAL,
-        "CANDLE_LIMIT": CANDLE_LIMIT,
-        "TOP_N": TOP_N,
-        "MAX_THREADS": MAX_THREADS,
-        "HTTP_TIMEOUT_SEC": HTTP_TIMEOUT_SEC,
-        "HTTP_RETRIES": HTTP_RETRIES,
-        "HTTP_BACKOFF_BASE": HTTP_BACKOFF_BASE,
-        "B_INGEST_URL": B_INGEST_URL,
-        "MARKETS_CACHE_TTL": MARKETS_CACHE_TTL
-    }
-    return jsonify(cfg), 200
-
 @app.get("/run-now")
 def run_now():
-    # تشغيل دورة فورية يدوياً
     threading.Thread(target=collect_once, daemon=True).start()
     return jsonify({"ok": True, "started": True}), 200
-
-@app.get("/last-error")
-def last_error():
-    with _lock:
-        return jsonify({"last_error": _last_error}), 200
 
 # =========================
 # ▶️ الإقلاع
 # =========================
 def start_threads():
-    th = threading.Thread(target=scheduler_loop, name="scheduler", daemon=True)
-    th.start()
+    threading.Thread(target=scheduler_loop, name="scheduler", daemon=True).start()
 
 start_threads()
 
 if __name__ == "__main__":
-    # تشغيل محلي أو على Railway مباشرةً دون gunicorn
     port = int(os.getenv("PORT", "8080"))
     log(f"Starting Flask on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
