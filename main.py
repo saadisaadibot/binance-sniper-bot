@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Bot A — Top Hybrid (5m + 10m + Preburst) — resilient I/O
-- أولويّة لـ r5m (كما في النسخة القديمة)
-- إضافة r10m + التقاط preburst/brk5bp لعدم تضييع البدايات
-- فلترة نهائية خفيفة بعد الدمج (volZ وعتبة نبض)
-- إرسال إلى Bot B مع نفس الحقول + preburst/brk5bp
-- باتشات استقرار: retries لـ HTTP/شموع + حداثة شمعة 180s + لوج واضح
+Bot A — Top Hybrid (5m + 10m + Preburst) — relaxed filters
+- أولوية r5m + التقاط r10m و preburst/brk5bp لتقليل تضييع الفرص
+- إرسال إلى Bot B مع كل الميزات
+- طباعة مختصرة: قبل/بعد (candidates/final)
+- HTTP retries + حداثة شمعة 180s + batching لتقليل 429
 """
 
 import os, time, math, random, threading
@@ -13,37 +12,37 @@ import requests
 from flask import Flask, jsonify
 
 # =========================
-# إعدادات قابلة للتعديل
+# إعدادات قابلة للتعديل (مع قيم مخففة)
 # =========================
 BITVAVO_URL    = "https://api.bitvavo.com"
 HTTP_TIMEOUT   = 8.0
 
 CYCLE_SEC      = int(os.getenv("CYCLE_SEC", "180"))
-TOP_N_5M       = int(os.getenv("TOP_N_5M", "10"))
-TOP_N_10M      = int(os.getenv("TOP_N_10M", "6"))
-TOP_N_PRE      = int(os.getenv("TOP_N_PRE", "6"))
+TOP_N_5M       = int(os.getenv("TOP_N_5M", "12"))
+TOP_N_10M      = int(os.getenv("TOP_N_10M", "8"))
+TOP_N_PRE      = int(os.getenv("TOP_N_PRE", "8"))
 
 MARKET_SUFFIX  = "-EUR"
-LIQ_RANK_MAX   = int(os.getenv("LIQ_RANK_MAX", "200"))
+LIQ_RANK_MAX   = int(os.getenv("LIQ_RANK_MAX", "400"))
 
 # وجهة Bot B
 B_INGEST_URL   = os.getenv("B_INGEST_URL", "https://express-bitv.up.railway.app/ingest")
 SEND_TIMEOUT   = float(os.getenv("SEND_TIMEOUT", "6.0"))
 
-# باتشات (خففنا الافتراضيات لتقليل 429 — عدّلها من env إذا بدك)
+# باتشات
 BATCH_SIZE     = int(os.getenv("BATCH_SIZE", "8"))
 BATCH_SLEEP    = float(os.getenv("BATCH_SLEEP", "0.50"))
 
-# فلترة “هجينة نظيفة” (نهائية بعد الدمج)
-VOLZ_MIN       = float(os.getenv("VOLZ_MIN", "-1.0"))   # استبعاد ما دون هذا
-MIN_R_BUMP     = float(os.getenv("MIN_R_BUMP", "0.3"))  # ٪: r5m أو r10m يجب أن يبلغ على الأقل هذا الحد
-ALLOW_PRE_PASS = os.getenv("ALLOW_PRE_PASS", "1") == "1"   # اسمح بمرشح preburst/brk5bp مع volZ>=0
+# فلترة “هجينة نظيفة” (نهائية بعد الدمج) — مخففة
+VOLZ_MIN       = float(os.getenv("VOLZ_MIN", "-0.5"))    # استبعد السيولة الضعيفة جداً
+MIN_R_BUMP     = float(os.getenv("MIN_R_BUMP", "0.15"))  # ٪: r5m أو r10m حد أدنى خفيف
+ALLOW_PRE_PASS = os.getenv("ALLOW_PRE_PASS", "1") == "1" # مرّر preburst/brk5bp بسيولة ≥ -0.3
 
 # =========================
 # HTTP (مع retries)
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent": "TopHybrid-A/1.2"})
+session.headers.update({"User-Agent": "TopHybrid-A/1.3"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -98,8 +97,8 @@ SUPPORTED = set()
 def load_markets():
     SUPPORTED.clear()
     data = http_get("/v2/markets")
-    if not data: 
-        print("[MKTS] failed to load markets"); 
+    if not data:
+        print("[MKTS] failed to load markets")
         return
     for it in data:
         m = norm_market(it.get("market", ""))
@@ -122,8 +121,7 @@ def feat_from_candles(cnd):
     now_ms = int(time.time() * 1000)
     if not cnd: return None
     try:
-        # توسعنا 90s → 180s لتفادي رفض أول دورة/شبكة بطيئة
-        if (now_ms - int(cnd[-1][0])) > 180_000:
+        if (now_ms - int(cnd[-1][0])) > 180_000:  # ≤ 180s
             return None
     except Exception:
         pass
@@ -167,7 +165,7 @@ def once_cycle():
 
     tick = http_get("/v2/ticker/24h")
     if not tick:
-        print("0/0"); return  # فشل جلب البيانات
+        print("0/0"); return
 
     pool = []
     for it in tick:
@@ -208,7 +206,6 @@ def once_cycle():
         time.sleep(BATCH_SLEEP)
 
     if not feats:
-        # ما في مرشحين أساسًا → قبل/بعد = 0/0
         print("0/0")
         return
 
@@ -230,19 +227,19 @@ def once_cycle():
     candidates = list(merged.items())
     before_cnt = len(candidates)
 
-    # فلتر نهائي نظيف
+    # فلتر نهائي مخفف
     final = []
     for m, f in candidates:
-        if f["volZ"] < VOLZ_MIN:
+        r5 = f["r5m"]; r10 = f["r10m"]; vz = f["volZ"]
+        if (r5 >= MIN_R_BUMP) or (r10 >= MIN_R_BUMP):
+            final.append((m, f)); continue
+        if ALLOW_PRE_PASS and (f.get("preburst") or f.get("brk5bp")) and vz >= -0.3:
+            final.append((m, f)); continue
+        if vz < VOLZ_MIN:
             continue
-        if f["r5m"] >= MIN_R_BUMP or f["r10m"] >= MIN_R_BUMP:
-            final.append((m, f))
-        elif ALLOW_PRE_PASS and (f["preburst"] or f["brk5bp"]) and f["volZ"] >= 0.0:
-            final.append((m, f))
 
     after_cnt = len(final)
     if after_cnt == 0:
-        # اطبع فقط الرقمين وارجع
         print(f"{before_cnt}/0")
         return
 
@@ -280,31 +277,32 @@ def once_cycle():
         }
         if http_post(B_INGEST_URL, cv):
             sent += 1
-        time.sleep(0.05)
+        time.sleep(0.05)  # خيط صغير لمنع ضغط B
 
-    # السطر المطلوب: قبل/بعد فقط
+    # الطباعة المطلوبة: قبل/بعد فقط
     print(f"{before_cnt}/{after_cnt}")
+
 # =========================
 # تشغيل دوري + Flask
 # =========================
 def loop_runner():
     while True:
-        try: 
+        try:
             once_cycle()
-        except Exception as e: 
+        except Exception as e:
             print("[CYCLE] error:", e)
         time.sleep(CYCLE_SEC)
 
 app = Flask(__name__)
 
 @app.route("/")
-def root(): return "TopHybrid A is alive ✅"
+def root(): return "TopHybrid A (relaxed) ✅"
 
 @app.route("/once")
-def once(): 
-    try: 
+def once():
+    try:
         once_cycle(); return jsonify(ok=True)
-    except Exception as e: 
+    except Exception as e:
         return jsonify(ok=False, err=str(e))
 
 @app.route("/webhook", methods=["POST","GET"])
