@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Bot A — Top Hybrid (5m + 10m + Preburst)
-- الأساس: يعطي أولوية لـ r5m (كما في النسخة القديمة)
-- إضافة: top بـ r10m + التقاط preburst/brk5bp لعدم تضييع البدايات
-- فلتر نهائي خفيف بعد الدمج (volZ وعتبة نبض معقولة)
+Bot A — Top Hybrid (5m + 10m + Preburst) — resilient I/O
+- أولويّة لـ r5m (كما في النسخة القديمة)
+- إضافة r10m + التقاط preburst/brk5bp لعدم تضييع البدايات
+- فلترة نهائية خفيفة بعد الدمج (volZ وعتبة نبض)
 - إرسال إلى Bot B مع نفس الحقول + preburst/brk5bp
+- باتشات استقرار: retries لـ HTTP/شموع + حداثة شمعة 180s + لوج واضح
 """
 
 import os, time, math, random, threading
@@ -17,7 +18,7 @@ from flask import Flask, jsonify
 BITVAVO_URL    = "https://api.bitvavo.com"
 HTTP_TIMEOUT   = 8.0
 
-CYCLE_SEC      = 180
+CYCLE_SEC      = int(os.getenv("CYCLE_SEC", "180"))
 TOP_N_5M       = int(os.getenv("TOP_N_5M", "10"))
 TOP_N_10M      = int(os.getenv("TOP_N_10M", "6"))
 TOP_N_PRE      = int(os.getenv("TOP_N_PRE", "6"))
@@ -27,35 +28,43 @@ LIQ_RANK_MAX   = int(os.getenv("LIQ_RANK_MAX", "200"))
 
 # وجهة Bot B
 B_INGEST_URL   = os.getenv("B_INGEST_URL", "https://express-bitv.up.railway.app/ingest")
-SEND_TIMEOUT   = 6.0
+SEND_TIMEOUT   = float(os.getenv("SEND_TIMEOUT", "6.0"))
 
-# باتشات
-BATCH_SIZE     = int(os.getenv("BATCH_SIZE", "10"))
-BATCH_SLEEP    = float(os.getenv("BATCH_SLEEP", "0.35"))
+# باتشات (خففنا الافتراضيات لتقليل 429 — عدّلها من env إذا بدك)
+BATCH_SIZE     = int(os.getenv("BATCH_SIZE", "8"))
+BATCH_SLEEP    = float(os.getenv("BATCH_SLEEP", "0.50"))
 
 # فلترة “هجينة نظيفة” (نهائية بعد الدمج)
 VOLZ_MIN       = float(os.getenv("VOLZ_MIN", "-1.0"))   # استبعاد ما دون هذا
 MIN_R_BUMP     = float(os.getenv("MIN_R_BUMP", "0.3"))  # ٪: r5m أو r10m يجب أن يبلغ على الأقل هذا الحد
-ALLOW_PRE_PASS = True   # اسمح بمرشح preburst/brk5bp يتجاوز MIN_R_BUMP إذا volZ>=0
+ALLOW_PRE_PASS = os.getenv("ALLOW_PRE_PASS", "1") == "1"   # اسمح بمرشح preburst/brk5bp مع volZ>=0
 
 # =========================
-# HTTP
+# HTTP (مع retries)
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent": "TopHybrid-A/1.1"})
+session.headers.update({"User-Agent": "TopHybrid-A/1.2"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
 def http_get(path, params=None, base=BITVAVO_URL, timeout=HTTP_TIMEOUT):
     url = f"{base}{path}"
-    try:
-        r = session.get(url, params=params, timeout=timeout)
-        if r.status_code == 429:
-            time.sleep(0.6 + random.random()*0.6)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"[HTTP] GET {path} failed:", e); return None
+    for i in range(3):
+        try:
+            r = session.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                sleep = 0.5 + i*0.6
+                print(f"[HTTP] 429 {path} — retry in {sleep:.1f}s")
+                time.sleep(sleep)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if i == 2:
+                print(f"[HTTP] GET {path} failed (try {i+1}/3):", e)
+                return None
+            time.sleep(0.3 + i*0.4)
+    return None
 
 def http_post(url, payload, timeout=SEND_TIMEOUT):
     try:
@@ -89,7 +98,9 @@ SUPPORTED = set()
 def load_markets():
     SUPPORTED.clear()
     data = http_get("/v2/markets")
-    if not data: return
+    if not data: 
+        print("[MKTS] failed to load markets"); 
+        return
     for it in data:
         m = norm_market(it.get("market", ""))
         if m.endswith(MARKET_SUFFIX):
@@ -97,20 +108,22 @@ def load_markets():
     print(f"[MKTS] loaded {len(SUPPORTED)} markets ({MARKET_SUFFIX})")
 
 # =========================
-# شموع وميزات
+# شموع وميزات (مع retries + حداثة 180s)
 # =========================
 def read_candles_1m(market, limit):
-    data = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit": limit})
-    if not data or not isinstance(data, list): return []
-    return data  # [time, open, high, low, close, volume]
+    for i in range(3):
+        data = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit": limit})
+        if data and isinstance(data, list):
+            return data  # [time, open, high, low, close, volume]
+        time.sleep(0.25 + i*0.35)
+    return []
 
 def feat_from_candles(cnd):
-    # تفادي الشموع القديمة جداً
     now_ms = int(time.time() * 1000)
-    if len(cnd) == 0: return None
-    # آخر شمعة لازم تكون ضمن 90s
+    if not cnd: return None
     try:
-        if (now_ms - int(cnd[-1][0])) > 90_000:
+        # توسعنا 90s → 180s لتفادي رفض أول دورة/شبكة بطيئة
+        if (now_ms - int(cnd[-1][0])) > 180_000:
             return None
     except Exception:
         pass
@@ -172,6 +185,8 @@ def once_cycle():
     feats = {}
     limit = 12
     scanned = 0
+    ok_candles = 0
+
     for batch in chunks(pool, BATCH_SIZE):
         for p in batch:
             m = p["market"]
@@ -180,10 +195,10 @@ def once_cycle():
             cnd = read_candles_1m(m, limit)
             if not cnd:
                 continue
+            ok_candles += 1
             f = feat_from_candles(cnd)
             if not f:
                 continue
-
             feats[m] = {
                 "symbol": p["symbol"],
                 "liq_rank": p["liq_rank"],
@@ -193,15 +208,16 @@ def once_cycle():
         time.sleep(BATCH_SLEEP)
 
     if not feats:
-        print("[CYCLE] no feats"); return
+        print(f"[CYCLE] markets≤{LIQ_RANK_MAX}  ok_candles={ok_candles}  feats=0 — (warmup/429 likely)")
+        return
 
     # --- 1) Top by 5m
     top5m = sorted(feats.items(), key=lambda kv: kv[1]["r5m"], reverse=True)[:TOP_N_5M]
 
-    # --- 2) Top by 10m (يلتقط بدايات أبطأ)
+    # --- 2) Top by 10m
     top10m = sorted(feats.items(), key=lambda kv: kv[1]["r10m"], reverse=True)[:TOP_N_10M]
 
-    # --- 3) Preburst/Breakout 5bp (حتى لو r5m أقل شوي)
+    # --- 3) Preburst/Breakout 5bp
     pre = [kv for kv in feats.items() if kv[1].get("preburst") or kv[1].get("brk5bp")]
     pre = sorted(pre, key=lambda kv: (kv[1]["preburst"], kv[1]["brk5bp"], kv[1]["r5m"], kv[1]["r10m"]), reverse=True)[:TOP_N_PRE]
 
@@ -212,7 +228,7 @@ def once_cycle():
             merged[m] = f
     candidates = list(merged.items())
 
-    # فلتر نهائي نظيف (خفيف — ما بيكسر الفرص)
+    # فلتر نهائي نظيف
     final = []
     for m, f in candidates:
         if f["volZ"] < VOLZ_MIN:
@@ -220,21 +236,20 @@ def once_cycle():
         if f["r5m"] >= MIN_R_BUMP or f["r10m"] >= MIN_R_BUMP:
             final.append((m, f))
         elif ALLOW_PRE_PASS and (f["preburst"] or f["brk5bp"]) and f["volZ"] >= 0.0:
-            # اسمح بمرشّح preburst/اختراق بسيط إذا السيولة موجبة
             final.append((m, f))
 
     if not final:
-        print(f"[CYCLE] no final after filter (scanned={scanned})")
+        print(f"[CYCLE] scanned={scanned}  cand={len(candidates)}  final=0 (VOLZ_MIN={VOLZ_MIN}, MIN_R_BUMP={MIN_R_BUMP}%)")
         return
 
-    # ترتيب الإرسال — أولوية r5m ثم r10m ثم volZ (يحافظ على “روح” النسخة القديمة)
+    # ترتيب الإرسال — r5m ثم r10m ثم volZ
     final_sorted = sorted(
         final,
         key=lambda kv: (kv[1]["r5m"], kv[1]["r10m"], kv[1]["volZ"]),
         reverse=True
     )
 
-    # حصر العدد المرسل (نفس TOP_N_5M كـ سقف افتراضي)
+    # سقف العدد المرسل
     cap = max(TOP_N_5M, min(16, TOP_N_5M + TOP_N_10M//2))
     picked = final_sorted[:cap]
 
@@ -263,7 +278,8 @@ def once_cycle():
             sent += 1
         time.sleep(0.05)  # خيط صغير بين الإرسال لمنع ضغط B
 
-    print(f"[CYCLE] scanned={scanned}  cand={len(candidates)}  final={len(final)}  sent={sent}/{cap} "
+    print(f"[CYCLE] markets≤{LIQ_RANK_MAX}  ok_candles={ok_candles}  feats={len(feats)}  "
+          f"cand={len(candidates)}  final={len(final)}  sent={sent}/{cap}  "
           f"(VOLZ_MIN={VOLZ_MIN}, MIN_R_BUMP={MIN_R_BUMP}%)")
 
 # =========================
@@ -271,8 +287,10 @@ def once_cycle():
 # =========================
 def loop_runner():
     while True:
-        try: once_cycle()
-        except Exception as e: print("[CYCLE] error:", e)
+        try: 
+            once_cycle()
+        except Exception as e: 
+            print("[CYCLE] error:", e)
         time.sleep(CYCLE_SEC)
 
 app = Flask(__name__)
@@ -282,8 +300,10 @@ def root(): return "TopHybrid A is alive ✅"
 
 @app.route("/once")
 def once(): 
-    try: once_cycle(); return jsonify(ok=True)
-    except Exception as e: return jsonify(ok=False, err=str(e))
+    try: 
+        once_cycle(); return jsonify(ok=True)
+    except Exception as e: 
+        return jsonify(ok=False, err=str(e))
 
 @app.route("/webhook", methods=["POST","GET"])
 def wrong_webhook():
