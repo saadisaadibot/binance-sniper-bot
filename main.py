@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Bot A — Top5m (Cleaner Hybrid)
-- الأساس: ترتيب حسب r5m فقط (كما في النسخة القديمة)
-- فلتر خفيف قبل الإرسال:
-    * استبعاد volZ < VOLZ_MIN (افتراضي -1.0)
-    * قبول فقط ما لديه حركة معقولة: r5m>=MIN_R_BUMP أو r10m>=MIN_R_BUMP (افتراضي 0.3%)
-- يرسل CV إلى Bot B مع مؤشرات preburst/اختراق 5bp
-- يحتفظ بنقاط السيولة والباتشات للحفاظ على الكفاءة
+Bot A — Top Hybrid (5m + 10m + Preburst)
+- الأساس: يعطي أولوية لـ r5m (كما في النسخة القديمة)
+- إضافة: top بـ r10m + التقاط preburst/brk5bp لعدم تضييع البدايات
+- فلتر نهائي خفيف بعد الدمج (volZ وعتبة نبض معقولة)
+- إرسال إلى Bot B مع نفس الحقول + preburst/brk5bp
 """
 
 import os, time, math, random, threading
@@ -20,27 +18,31 @@ BITVAVO_URL    = "https://api.bitvavo.com"
 HTTP_TIMEOUT   = 8.0
 
 CYCLE_SEC      = 180
-TOP_N_5M       = 10
-MARKET_SUFFIX  = "-EUR"
-LIQ_RANK_MAX   = 200
+TOP_N_5M       = int(os.getenv("TOP_N_5M", "10"))
+TOP_N_10M      = int(os.getenv("TOP_N_10M", "6"))
+TOP_N_PRE      = int(os.getenv("TOP_N_PRE", "6"))
 
-# وجهة Bot B (يمكن تمريرها من البيئة)
+MARKET_SUFFIX  = "-EUR"
+LIQ_RANK_MAX   = int(os.getenv("LIQ_RANK_MAX", "200"))
+
+# وجهة Bot B
 B_INGEST_URL   = os.getenv("B_INGEST_URL", "https://express-bitv.up.railway.app/ingest")
 SEND_TIMEOUT   = 6.0
 
 # باتشات
-BATCH_SIZE     = 10
-BATCH_SLEEP    = 0.35
+BATCH_SIZE     = int(os.getenv("BATCH_SIZE", "10"))
+BATCH_SLEEP    = float(os.getenv("BATCH_SLEEP", "0.35"))
 
-# فلترة “هجينة نظيفة”
+# فلترة “هجينة نظيفة” (نهائية بعد الدمج)
 VOLZ_MIN       = float(os.getenv("VOLZ_MIN", "-1.0"))   # استبعاد ما دون هذا
 MIN_R_BUMP     = float(os.getenv("MIN_R_BUMP", "0.3"))  # ٪: r5m أو r10m يجب أن يبلغ على الأقل هذا الحد
+ALLOW_PRE_PASS = True   # اسمح بمرشح preburst/brk5bp يتجاوز MIN_R_BUMP إذا volZ>=0
 
 # =========================
 # HTTP
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent": "Top5m-Hybrid/1.0"})
+session.headers.update({"User-Agent": "TopHybrid-A/1.1"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -103,11 +105,22 @@ def read_candles_1m(market, limit):
     return data  # [time, open, high, low, close, volume]
 
 def feat_from_candles(cnd):
+    # تفادي الشموع القديمة جداً
+    now_ms = int(time.time() * 1000)
+    if len(cnd) == 0: return None
+    # آخر شمعة لازم تكون ضمن 90s
+    try:
+        if (now_ms - int(cnd[-1][0])) > 90_000:
+            return None
+    except Exception:
+        pass
+
     closes = [float(x[4]) for x in cnd]
     vols   = [float(x[5]) for x in cnd]
     c_now  = closes[-1]
     r5m    = pct(c_now, closes[-6]) if len(closes) > 6 else 0.0
     r10m   = pct(c_now, closes[-11]) if len(closes) > 11 else 0.0
+
     base   = vols[-20:] if len(vols) >= 20 else vols
     mu     = sum(base)/len(base) if base else 0.0
     sigma  = math.sqrt(sum((v-mu)**2 for v in base)/len(base)) if base else 0.0
@@ -122,10 +135,19 @@ def feat_from_candles(cnd):
     preburst = (rng10 <= 0.80 and r5m >= 0.30 and r10m <= 1.00)
     breakout5bp = (c_now > hi5 * 1.0005)
 
-    return r5m, r10m, volZ, closes, rng10, preburst, breakout5bp
+    return {
+        "price_now": c_now,
+        "r5m": r5m,
+        "r10m": r10m,
+        "volZ": volZ,
+        "range10": rng10,
+        "preburst": bool(preburst),
+        "brk5bp": bool(breakout5bp),
+        "price_5m_ago": float(closes[-6] if len(closes) > 6 else closes[0]),
+    }
 
 # =========================
-# دورة الصيد (Top5m + فلتر نظيف)
+# دورة الصيد (Hybrid)
 # =========================
 def once_cycle():
     load_markets()
@@ -149,65 +171,100 @@ def once_cycle():
 
     feats = {}
     limit = 12
+    scanned = 0
     for batch in chunks(pool, BATCH_SIZE):
         for p in batch:
             m = p["market"]
-            if p["liq_rank"] > LIQ_RANK_MAX: 
+            if p["liq_rank"] > LIQ_RANK_MAX:
                 continue
             cnd = read_candles_1m(m, limit)
-            if not cnd: 
+            if not cnd:
                 continue
-            r5m, r10m, volZ, closes, rng10, preburst, brk5bp = feat_from_candles(cnd)
-
-            # فلتر “الهجين النظيف”
-            if volZ < VOLZ_MIN:
-                continue
-            if not (r5m >= MIN_R_BUMP or r10m >= MIN_R_BUMP):
+            f = feat_from_candles(cnd)
+            if not f:
                 continue
 
             feats[m] = {
                 "symbol": p["symbol"],
-                "r5m": round(r5m, 4),
-                "r10m": round(r10m, 4),
-                "volZ": round(volZ, 4),
                 "liq_rank": p["liq_rank"],
-                "price_now": float(closes[-1]),
-                "price_5m_ago": float(closes[-6] if len(closes) > 6 else closes[0]),
-                "range10": round(rng10, 3),
-                "preburst": bool(preburst),
-                "brk5bp": bool(brk5bp),
+                **{k: (round(v,4) if isinstance(v,float) else v) for k,v in f.items()}
             }
+            scanned += 1
         time.sleep(BATCH_SLEEP)
 
-    # ترتيب نهائي حسب r5m فقط (كما في نسختك القديمة)
-    ranked = sorted(feats.items(), key=lambda kv: kv[1]["r5m"], reverse=True)
-    picked = ranked[:TOP_N_5M]
+    if not feats:
+        print("[CYCLE] no feats"); return
+
+    # --- 1) Top by 5m
+    top5m = sorted(feats.items(), key=lambda kv: kv[1]["r5m"], reverse=True)[:TOP_N_5M]
+
+    # --- 2) Top by 10m (يلتقط بدايات أبطأ)
+    top10m = sorted(feats.items(), key=lambda kv: kv[1]["r10m"], reverse=True)[:TOP_N_10M]
+
+    # --- 3) Preburst/Breakout 5bp (حتى لو r5m أقل شوي)
+    pre = [kv for kv in feats.items() if kv[1].get("preburst") or kv[1].get("brk5bp")]
+    pre = sorted(pre, key=lambda kv: (kv[1]["preburst"], kv[1]["brk5bp"], kv[1]["r5m"], kv[1]["r10m"]), reverse=True)[:TOP_N_PRE]
+
+    # دمج + إزالة تكرار
+    merged = {}
+    for group in (top5m, top10m, pre):
+        for m, f in group:
+            merged[m] = f
+    candidates = list(merged.items())
+
+    # فلتر نهائي نظيف (خفيف — ما بيكسر الفرص)
+    final = []
+    for m, f in candidates:
+        if f["volZ"] < VOLZ_MIN:
+            continue
+        if f["r5m"] >= MIN_R_BUMP or f["r10m"] >= MIN_R_BUMP:
+            final.append((m, f))
+        elif ALLOW_PRE_PASS and (f["preburst"] or f["brk5bp"]) and f["volZ"] >= 0.0:
+            # اسمح بمرشّح preburst/اختراق بسيط إذا السيولة موجبة
+            final.append((m, f))
+
+    if not final:
+        print(f"[CYCLE] no final after filter (scanned={scanned})")
+        return
+
+    # ترتيب الإرسال — أولوية r5m ثم r10m ثم volZ (يحافظ على “روح” النسخة القديمة)
+    final_sorted = sorted(
+        final,
+        key=lambda kv: (kv[1]["r5m"], kv[1]["r10m"], kv[1]["volZ"]),
+        reverse=True
+    )
+
+    # حصر العدد المرسل (نفس TOP_N_5M كـ سقف افتراضي)
+    cap = max(TOP_N_5M, min(16, TOP_N_5M + TOP_N_10M//2))
+    picked = final_sorted[:cap]
 
     sent = 0
+    now_ts = int(time.time())
     for m, f in picked:
         cv = {
             "market": m,
             "symbol": f["symbol"],
-            "ts": int(time.time()),
+            "ts": now_ts,
             "feat": {
-                "r5m": f["r5m"],
-                "r10m": f["r10m"],
-                "volZ": f["volZ"],
-                "price_now": f["price_now"],
-                "price_5m_ago": f["price_5m_ago"],
-                "liq_rank": f["liq_rank"],
-                "range10": f["range10"],
-                "preburst": f["preburst"],
-                "brk5bp": f["brk5bp"],
+                "r5m": float(f["r5m"]),
+                "r10m": float(f["r10m"]),
+                "volZ": float(f["volZ"]),
+                "price_now": float(f["price_now"]),
+                "price_5m_ago": float(f["price_5m_ago"]),
+                "liq_rank": int(f["liq_rank"]),
+                "range10": float(f["range10"]),
+                "preburst": bool(f["preburst"]),
+                "brk5bp": bool(f["brk5bp"]),
             },
-            "tags": ["top5m:hybrid-clean"],
+            "tags": ["top:hybrid", "src:bitvavo:1m"],
             "ttl_sec": 1800
         }
         if http_post(B_INGEST_URL, cv):
             sent += 1
+        time.sleep(0.05)  # خيط صغير بين الإرسال لمنع ضغط B
 
-    print(f"[CYCLE] Sent {sent}/{TOP_N_5M} to B "
-          f"(filters: volZ≥{VOLZ_MIN}, r≥{MIN_R_BUMP}%)")
+    print(f"[CYCLE] scanned={scanned}  cand={len(candidates)}  final={len(final)}  sent={sent}/{cap} "
+          f"(VOLZ_MIN={VOLZ_MIN}, MIN_R_BUMP={MIN_R_BUMP}%)")
 
 # =========================
 # تشغيل دوري + Flask
@@ -221,7 +278,7 @@ def loop_runner():
 app = Flask(__name__)
 
 @app.route("/")
-def root(): return "Top5m Hybrid A is alive ✅"
+def root(): return "TopHybrid A is alive ✅"
 
 @app.route("/once")
 def once(): 
@@ -231,7 +288,7 @@ def once():
 @app.route("/webhook", methods=["POST","GET"])
 def wrong_webhook():
     print("[A] ❌ Wrong /webhook call — Webhook must go to Bot B.")
-    return jsonify(ok=False, hint="Use https://express-bitv.up.railway.app/webhook for B"), 404
+    return jsonify(ok=False, hint="Use B /webhook"), 404
 
 def start(): threading.Thread(target=loop_runner, daemon=True).start()
 start()
