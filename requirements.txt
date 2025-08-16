@@ -1,5 +1,4 @@
-Flask==2.3.3
-gunicorn>=23
+flask
+gunicorn
 python-dotenv
 requests
-redis
