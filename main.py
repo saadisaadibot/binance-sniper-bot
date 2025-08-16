@@ -5,29 +5,27 @@ from threading import Thread
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
+# =========================
+# 🔧 التحميل والتهيئة
+# =========================
 load_dotenv()
 app = Flask(__name__)
 
-# =========================
-# ⚙️ إعدادات قابلة للتعديل
-# =========================
 BITVAVO_URL           = os.getenv("BITVAVO_URL", "https://api.bitvavo.com/v2")
 HTTP_TIMEOUT          = float(os.getenv("HTTP_TIMEOUT", 6.0))
-SCAN_INTERVAL_SEC     = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))    # كل كم ثانية نسحب الأسعار
-MARKETS_REFRESH_SEC   = int(os.getenv("MARKETS_REFRESH_SEC", 60))     # تحديث لائحة الأسواق
-HISTORY_SEC           = int(os.getenv("HISTORY_SEC", 900))            # نحفظ 15 دقيقة
-FOLLOWUP_WINDOW_SEC   = int(os.getenv("FOLLOWUP_WINDOW_SEC", 300))    # متابعة 5 دقائق
-ALERT_COOLDOWN_SEC    = int(os.getenv("ALERT_COOLDOWN_SEC", 300))     # كولداون لكل عملة
-PREDICT_LOOP_SLEEP    = float(os.getenv("PREDICT_LOOP_SLEEP", 2.0))   # نوم لووب التوقع
-WARMUP_SEC            = int(os.getenv("WARMUP_SEC", 180))             # 3 دقائق ورم-أب
-DEBUG_LOG             = os.getenv("DEBUG_LOG", "0") == "1"            # لوج تحليلي
-STATS_EVERY_SEC       = int(os.getenv("STATS_EVERY_SEC", 60))         # نبضات إحصائية
+SCAN_INTERVAL_SEC     = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))
+MARKETS_REFRESH_SEC   = int(os.getenv("MARKETS_REFRESH_SEC", 60))
+HISTORY_SEC           = int(os.getenv("HISTORY_SEC", 900))
+FOLLOWUP_WINDOW_SEC   = int(os.getenv("FOLLOWUP_WINDOW_SEC", 300))
+ALERT_COOLDOWN_SEC    = int(os.getenv("ALERT_COOLDOWN_SEC", 300))
+PREDICT_LOOP_SLEEP    = float(os.getenv("PREDICT_LOOP_SLEEP", 2.0))
+WARMUP_SEC            = int(os.getenv("WARMUP_SEC", 180))
+DEBUG_LOG             = os.getenv("DEBUG_LOG", "0") == "1"
+STATS_EVERY_SEC       = int(os.getenv("STATS_EVERY_SEC", 60))
 
-# تليغرام (اختياري)
 TG_BOT_TOKEN          = os.getenv("BOT_TOKEN")
 TG_CHAT_ID            = os.getenv("CHAT_ID")
 
-# عتبات (يمكن تعديلها من env)
 def _env_float(name, default):
     try:
         v = os.getenv(name)
@@ -36,29 +34,28 @@ def _env_float(name, default):
         return default
 
 thresholds = {
-    "MIN_SPEED_PM": _env_float("MIN_SPEED_PM", 0.40),   # %/د = r30s * 2
-    "MIN_ACCEL_PM": _env_float("MIN_ACCEL_PM", 0.08),   # فرق السرعة الآن - السابقة
+    "MIN_SPEED_PM": _env_float("MIN_SPEED_PM", 0.40),   # %/د = r30s*2
+    "MIN_ACCEL_PM": _env_float("MIN_ACCEL_PM", 0.08),   # فرق السرعة
     "VOL_RATIO_MIN": _env_float("VOL_RATIO_MIN", 1.00), # نشاط قصير/طويل
     "EXPECTED_MIN":  _env_float("EXPECTED_MIN", 1.80),  # أقل قفزة متوقعة
 }
 
 # =========================
-# 🧠 الحالة
+# 🧠 الحالة العامة
 # =========================
-prices         = defaultdict(lambda: deque())     # base -> deque[(ts, price)]
-last_alert_ts  = {}                               # base -> ts
-predictions    = {}                               # base -> {"time","expected","start_price","status"}
-history_results= deque(maxlen=500)                # [(ts, base, status, expected, actual)]
-learning_window= deque(maxlen=40)                 # "hit" / "miss"
-_symbols_cache = []                               # لائحة الرموز المستهدفة (EUR)
-_last_markets  = 0
-_started       = False
-_last_stats    = 0
+prices          = defaultdict(lambda: deque())   # base -> deque[(ts, price)]
+last_alert_ts   = {}                             # base -> ts
+predictions     = {}                             # base -> {"time","expected","start_price","status"}
+history_results = deque(maxlen=500)
+learning_window = deque(maxlen=40)
+_symbols_cache  = []
+_last_markets   = 0
+_started        = False
 
 # =========================
-# 📡 مساعدات
+# 🛠️ أدوات
 # =========================
-def send_message(text):
+def send_message(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("[NO_TG]", text)
         return
@@ -80,9 +77,6 @@ def http_get_json(url, params=None, timeout=HTTP_TIMEOUT):
         pass
     return None
 
-# =========================
-# 📊 حسابات
-# =========================
 def pct_change(a, b):
     try:
         return (a - b) / b * 100.0 if (b and b > 0) else 0.0
@@ -99,10 +93,7 @@ def window_price(base, lookback_sec, now):
     return ref
 
 def micro_volatility(base, now):
-    """
-    نشاط قصير (30s) مقارنة بأساس طويل (300s).
-    >1 يعني حرارة راهنة أعلى من المعتاد.
-    """
+    """نشاط قصير (30s) مقابل أساس طويل (300s)."""
     dq = prices[base]
     if len(dq) < 5:
         return 1.0
@@ -135,7 +126,6 @@ def analyze(base):
     p180 = window_price(base, 180, now)
     p300 = window_price(base, 300, now)
 
-    # لازم يكون عندي مراجع كفاية
     if not (p30 and p60):
         return None
 
@@ -149,49 +139,38 @@ def analyze(base):
     accel_pm      = speed_pm_cur - speed_pm_prev
     vol_ratio     = micro_volatility(base, now)
 
-    # تقدير قفزة 2–5 دقائق
     horizon_factor = 1.8
     vol_clamped    = max(0.9, min(vol_ratio, 2.5))
     expected       = speed_pm_cur * (1.0 + accel_pm / 100.0) * vol_clamped * horizon_factor
 
     res = {
-        "symbol": base,
-        "cur": cur,
-        "r30s": r30s,
-        "r60s": r60s,
-        "r3m": r3m,
-        "r5m": r5m,
-        "speed_pm": speed_pm_cur,
-        "accel_pm": accel_pm,
-        "vol_ratio": vol_ratio,
-        "expected": expected
+        "symbol": base, "cur": cur,
+        "r30s": r30s, "r60s": r60s, "r3m": r3m, "r5m": r5m,
+        "speed_pm": speed_pm_cur, "accel_pm": accel_pm,
+        "vol_ratio": vol_ratio, "expected": expected
     }
     if DEBUG_LOG:
         print("[ANALYZE]", res)
     return res
 
 # =========================
-# 🧰 مصادر الأسعار
+# 📡 مصادر الأسعار
 # =========================
 def refresh_markets(now):
     global _symbols_cache, _last_markets
     if (now - _last_markets) < MARKETS_REFRESH_SEC and _symbols_cache:
         return
-    markets = http_get_json(f"{BITVAVO_URL}/markets")
-    if not markets:
+    mk = http_get_json(f"{BITVAVO_URL}/markets")
+    if not mk:
         return
-    _symbols_cache = [m.get("base") for m in markets
+    _symbols_cache = [m.get("base") for m in mk
                       if m.get("quote") == "EUR" and m.get("status") == "trading"]
     _last_markets = now
     if DEBUG_LOG:
         print(f"[MARKETS] tracking {len(_symbols_cache)} EUR markets")
 
 def bulk_prices():
-    """
-    محاولة سحب كل الأسعار دفعة واحدة.
-    Bitvavo /ticker/price (بدون market) عادة يعيد قائمة بكل الأزواج.
-    لو فشل/رجع None → نرجّع {} ليستخدم المجمّع الوضع الفردي.
-    """
+    """يحاول جلب كل الأسعار دفعة واحدة؛ يرجع dict base->price أو {}."""
     data = http_get_json(f"{BITVAVO_URL}/ticker/price")
     out = {}
     if isinstance(data, list):
@@ -217,12 +196,10 @@ def collector():
             refresh_markets(now)
             symbols = list(_symbols_cache)
 
-            # جرّب bulk أولاً
             price_map = bulk_prices()
             used_bulk = bool(price_map)
 
             if not used_bulk and symbols:
-                # fallback فردي
                 for base in symbols:
                     row = http_get_json(f"{BITVAVO_URL}/ticker/price", {"market": f"{base}-EUR"})
                     if not row:
@@ -232,7 +209,6 @@ def collector():
                     except Exception:
                         continue
 
-            # خزّن الأسعار
             for base, price in price_map.items():
                 dq = prices[base]
                 dq.append((now, price))
@@ -242,9 +218,8 @@ def collector():
 
             if DEBUG_LOG and (now - last_stats) >= STATS_EVERY_SEC:
                 last_stats = now
-                filled = sum(1 for k, v in prices.items() if v)
-                print(f"[COLLECT] {'bulk' if used_bulk else 'single'} "
-                      f"| symbols={len(symbols)} | with_data={filled} | misses={misses}")
+                filled = sum(1 for _, v in prices.items() if v)
+                print(f"[COLLECT] {'bulk' if used_bulk else 'single'} | sym={len(symbols)} | with_data={filled} | misses={misses}")
                 misses = 0
 
         except Exception as e:
@@ -259,7 +234,6 @@ def collector():
 # 🤖 متنبّه الإشعارات + المتابعة
 # =========================
 def predictor():
-    reasons_cap = 6  # لا نغرق اللوج
     while True:
         try:
             now = time.time()
@@ -276,7 +250,6 @@ def predictor():
                         learning_window.append("hit" if "✅" in status else "miss")
 
             # تحليل جديد
-            printed = 0
             for base, dq in list(prices.items()):
                 if not dq or (dq[-1][0] - dq[0][0]) < WARMUP_SEC:
                     continue
@@ -286,29 +259,16 @@ def predictor():
                     continue
 
                 # فلاتر
-                reason = None
-                if res["speed_pm"] < thresholds["MIN_SPEED_PM"]:
-                    reason = "speed"
-                elif res["accel_pm"] < thresholds["MIN_ACCEL_PM"]:
-                    reason = "accel"
-                elif res["vol_ratio"] < thresholds["VOL_RATIO_MIN"]:
-                    reason = "vol"
-                elif res["expected"] < thresholds["EXPECTED_MIN"]:
-                    reason = "expected"
-
-                if reason:
-                    if DEBUG_LOG and printed < reasons_cap:
-                        printed += 1
-                        print(f"[SKIP] {base} by {reason} "
-                              f"(spd {res['speed_pm']:.2f}, acc {res['accel_pm']:.2f}, "
-                              f"vol {res['vol_ratio']:.2f}, exp {res['expected']:.2f})")
-                    continue
+                if res["speed_pm"] < thresholds["MIN_SPEED_PM"]:   continue
+                if res["accel_pm"] < thresholds["MIN_ACCEL_PM"]:   continue
+                if res["vol_ratio"] < thresholds["VOL_RATIO_MIN"]: continue
+                if res["expected"]  < thresholds["EXPECTED_MIN"]:  continue
 
                 # كولداون
                 if base in last_alert_ts and now - last_alert_ts[base] < ALERT_COOLDOWN_SEC:
                     continue
 
-                # سجّل التوقع
+                # سجل التوقع
                 last_alert_ts[base] = now
                 predictions[base] = {
                     "time": now,
@@ -376,7 +336,7 @@ def self_learning():
                 traceback.print_exc()
 
 # =========================
-# 🏁 تشغيل الخيوط تلقائيًا (يعمل مع Gunicorn)
+# 🏁 تشغيل الخيوط تلقائيًا (متوافق مع Gunicorn)
 # =========================
 def start_all():
     global _started
@@ -389,7 +349,7 @@ def start_all():
     if DEBUG_LOG:
         print("[BOOT] threads started")
 
-# شغّل عند الاستيراد + أكد عند أول طلب
+# شغّل عند الاستيراد + أكد قبل أول طلب
 start_all()
 
 @app.before_first_request
@@ -397,7 +357,7 @@ def _kickoff_threads():
     start_all()
 
 # =========================
-# 🌐 تيليجرام: الملخص/الضبط
+# 🌐 Webhook & Health
 # =========================
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -444,9 +404,6 @@ def telegram_webhook():
 
     return "ok", 200
 
-# =========================
-# 🌐 صحة وتشخيص
-# =========================
 @app.route("/", methods=["GET"])
 def health():
     return "Aggressive Predictor is alive ✅", 200
@@ -454,7 +411,7 @@ def health():
 @app.route("/statusz", methods=["GET"])
 def statusz():
     now = time.time()
-    with_data = sum(1 for k, v in prices.items() if v)
+    with_data  = sum(1 for _, v in prices.items() if v)
     open_preds = sum(1 for v in predictions.values() if v.get("status") is None)
     return jsonify({
         "markets_tracked": len(_symbols_cache),
@@ -469,8 +426,9 @@ def statusz():
     }), 200
 
 # =========================
-# 🚀 التشغيل المحلي
+# 🖥️ التشغيل المحلي فقط
 # =========================
 if __name__ == "__main__":
-    # على Railway استخدم: web: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+    # على Railway استخدم Gunicorn:
+    # web: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
