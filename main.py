@@ -5,12 +5,12 @@ from threading import Thread
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-# =========================
-# 🔧 التحميل والتهيئة
-# =========================
 load_dotenv()
 app = Flask(__name__)
 
+# =========================
+# ⚙️ إعدادات
+# =========================
 BITVAVO_URL           = os.getenv("BITVAVO_URL", "https://api.bitvavo.com/v2")
 HTTP_TIMEOUT          = float(os.getenv("HTTP_TIMEOUT", 6.0))
 SCAN_INTERVAL_SEC     = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))
@@ -34,31 +34,31 @@ def _env_float(name, default):
         return default
 
 thresholds = {
-    "MIN_SPEED_PM": _env_float("MIN_SPEED_PM", 0.40),   # %/د = r30s*2
-    "MIN_ACCEL_PM": _env_float("MIN_ACCEL_PM", 0.08),   # فرق السرعة
-    "VOL_RATIO_MIN": _env_float("VOL_RATIO_MIN", 1.00), # نشاط قصير/طويل
-    "EXPECTED_MIN":  _env_float("EXPECTED_MIN", 1.80),  # أقل قفزة متوقعة
+    "MIN_SPEED_PM": _env_float("MIN_SPEED_PM", 0.40),
+    "MIN_ACCEL_PM": _env_float("MIN_ACCEL_PM", 0.08),
+    "VOL_RATIO_MIN": _env_float("VOL_RATIO_MIN", 1.00),
+    "EXPECTED_MIN":  _env_float("EXPECTED_MIN", 1.80),
 }
 
 # =========================
-# 🧠 الحالة العامة
+# 🧠 الحالة
 # =========================
 prices          = defaultdict(lambda: deque())   # base -> deque[(ts, price)]
-last_alert_ts   = {}                             # base -> ts
-predictions     = {}                             # base -> {"time","expected","start_price","status"}
+last_alert_ts   = {}
+predictions     = {}
 history_results = deque(maxlen=500)
 learning_window = deque(maxlen=40)
 _symbols_cache  = []
 _last_markets   = 0
-_started        = False
+
+_started = False   # ← تشغيل مؤجل للخيوط
 
 # =========================
 # 🛠️ أدوات
 # =========================
-def send_message(text: str):
+def send_message(text):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("[NO_TG]", text)
-        return
+        print("[NO_TG]", text); return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
@@ -88,46 +88,34 @@ def window_price(base, lookback_sec, now):
     ref = None
     for ts, pr in reversed(dq):
         if now - ts >= lookback_sec:
-            ref = pr
-            break
+            ref = pr; break
     return ref
 
 def micro_volatility(base, now):
-    """نشاط قصير (30s) مقابل أساس طويل (300s)."""
     dq = prices[base]
-    if len(dq) < 5:
-        return 1.0
-
+    if len(dq) < 5: return 1.0
     def avg_abs_ret(window_sec):
         rets, prev = [], None
         for ts, p in dq:
             if now - ts <= window_sec:
-                if prev is not None:
-                    rets.append(abs(pct_change(p, prev)))
+                if prev is not None: rets.append(abs(pct_change(p, prev)))
                 prev = p
-        return (sum(rets) / len(rets)) if rets else 0.0
-
-    short = avg_abs_ret(30)
-    long  = avg_abs_ret(300)
-    if long <= 0:
-        return 1.0
-    ratio = short / long
+        return (sum(rets)/len(rets)) if rets else 0.0
+    short = avg_abs_ret(30); long = avg_abs_ret(300)
+    if long <= 0: return 1.0
+    ratio = short/long
     return max(0.7, min(ratio, 3.0))
 
 def analyze(base):
     now = time.time()
     dq = prices[base]
-    if len(dq) < 5:
-        return None
-
+    if len(dq) < 5: return None
     cur  = dq[-1][1]
     p30  = window_price(base, 30,  now)
     p60  = window_price(base, 60,  now)
     p180 = window_price(base, 180, now)
     p300 = window_price(base, 300, now)
-
-    if not (p30 and p60):
-        return None
+    if not (p30 and p60): return None
 
     r30s = pct_change(cur, p30)
     r60s = pct_change(cur, p60)
@@ -141,16 +129,12 @@ def analyze(base):
 
     horizon_factor = 1.8
     vol_clamped    = max(0.9, min(vol_ratio, 2.5))
-    expected       = speed_pm_cur * (1.0 + accel_pm / 100.0) * vol_clamped * horizon_factor
+    expected       = speed_pm_cur * (1.0 + accel_pm/100.0) * vol_clamped * horizon_factor
 
-    res = {
-        "symbol": base, "cur": cur,
-        "r30s": r30s, "r60s": r60s, "r3m": r3m, "r5m": r5m,
-        "speed_pm": speed_pm_cur, "accel_pm": accel_pm,
-        "vol_ratio": vol_ratio, "expected": expected
-    }
-    if DEBUG_LOG:
-        print("[ANALYZE]", res)
+    res = {"symbol": base, "cur": cur, "r30s": r30s, "r60s": r60s,
+           "r3m": r3m, "r5m": r5m, "speed_pm": speed_pm_cur,
+           "accel_pm": accel_pm, "vol_ratio": vol_ratio, "expected": expected}
+    if DEBUG_LOG: print("[ANALYZE]", res)
     return res
 
 # =========================
@@ -161,16 +145,13 @@ def refresh_markets(now):
     if (now - _last_markets) < MARKETS_REFRESH_SEC and _symbols_cache:
         return
     mk = http_get_json(f"{BITVAVO_URL}/markets")
-    if not mk:
-        return
+    if not mk: return
     _symbols_cache = [m.get("base") for m in mk
                       if m.get("quote") == "EUR" and m.get("status") == "trading"]
     _last_markets = now
-    if DEBUG_LOG:
-        print(f"[MARKETS] tracking {len(_symbols_cache)} EUR markets")
+    if DEBUG_LOG: print(f"[MARKETS] tracking {len(_symbols_cache)} EUR markets")
 
 def bulk_prices():
-    """يحاول جلب كل الأسعار دفعة واحدة؛ يرجع dict base->price أو {}."""
     data = http_get_json(f"{BITVAVO_URL}/ticker/price")
     out = {}
     if isinstance(data, list):
@@ -188,8 +169,7 @@ def bulk_prices():
 # 🔁 جامع الأسعار
 # =========================
 def collector():
-    last_stats = 0
-    misses = 0
+    last_stats, misses = 0, 0
     while True:
         try:
             now = time.time()
@@ -202,19 +182,15 @@ def collector():
             if not used_bulk and symbols:
                 for base in symbols:
                     row = http_get_json(f"{BITVAVO_URL}/ticker/price", {"market": f"{base}-EUR"})
-                    if not row:
-                        continue
-                    try:
-                        price_map[base] = float(row["price"])
-                    except Exception:
-                        continue
+                    if not row: continue
+                    try: price_map[base] = float(row["price"])
+                    except Exception: continue
 
             for base, price in price_map.items():
                 dq = prices[base]
                 dq.append((now, price))
                 cutoff = now - HISTORY_SEC
-                while dq and dq[0][0] < cutoff:
-                    dq.popleft()
+                while dq and dq[0][0] < cutoff: dq.popleft()
 
             if DEBUG_LOG and (now - last_stats) >= STATS_EVERY_SEC:
                 last_stats = now
@@ -231,13 +207,13 @@ def collector():
         time.sleep(SCAN_INTERVAL_SEC)
 
 # =========================
-# 🤖 متنبّه الإشعارات + المتابعة
+# 🤖 متنبّه + متابعة
 # =========================
 def predictor():
     while True:
         try:
             now = time.time()
-            # إقفال التتبعات المنتهية
+            # إغلاق المتابعات المنتهية
             for base, pred in list(predictions.items()):
                 if pred["status"] is None and now - pred["time"] >= FOLLOWUP_WINDOW_SEC:
                     dq = prices.get(base)
@@ -249,33 +225,23 @@ def predictor():
                         history_results.append((now, base, status, pred["expected"], actual))
                         learning_window.append("hit" if "✅" in status else "miss")
 
-            # تحليل جديد
+            # تحليلات جديدة
             for base, dq in list(prices.items()):
-                if not dq or (dq[-1][0] - dq[0][0]) < WARMUP_SEC:
-                    continue
-
+                if not dq or (dq[-1][0] - dq[0][0]) < WARMUP_SEC: continue
                 res = analyze(base)
-                if not res:
-                    continue
+                if not res: continue
 
-                # فلاتر
                 if res["speed_pm"] < thresholds["MIN_SPEED_PM"]:   continue
                 if res["accel_pm"] < thresholds["MIN_ACCEL_PM"]:   continue
                 if res["vol_ratio"] < thresholds["VOL_RATIO_MIN"]: continue
                 if res["expected"]  < thresholds["EXPECTED_MIN"]:  continue
 
-                # كولداون
                 if base in last_alert_ts and now - last_alert_ts[base] < ALERT_COOLDOWN_SEC:
                     continue
 
-                # سجل التوقع
                 last_alert_ts[base] = now
-                predictions[base] = {
-                    "time": now,
-                    "expected": res["expected"],
-                    "start_price": res["cur"],
-                    "status": None
-                }
+                predictions[base] = {"time": now, "expected": res["expected"],
+                                     "start_price": res["cur"], "status": None}
 
                 msg = (
                     f"🚀 توقع قفزة: {base}\n"
@@ -293,33 +259,26 @@ def predictor():
         time.sleep(PREDICT_LOOP_SLEEP)
 
 # =========================
-# 🧪 تعلّم ذاتي سريع
+# 🧪 تعلّم ذاتي
 # =========================
 def self_learning():
     while True:
         try:
             time.sleep(60)
             total = len(learning_window)
-            if total < 8:
-                continue
+            if total < 8: continue
             hits = sum(1 for x in learning_window if x == "hit")
             rate = hits / total
 
-            ms = thresholds["MIN_SPEED_PM"]
-            ma = thresholds["MIN_ACCEL_PM"]
-            vr = thresholds["VOL_RATIO_MIN"]
-            ex = thresholds["EXPECTED_MIN"]
+            ms = thresholds["MIN_SPEED_PM"]; ma = thresholds["MIN_ACCEL_PM"]
+            vr = thresholds["VOL_RATIO_MIN"]; ex = thresholds["EXPECTED_MIN"]
 
             if rate < 0.40:
-                ms = min(ms + 0.10, 1.50)
-                ma = min(ma + 0.05, 0.60)
-                vr = min(vr + 0.10, 2.0)
-                ex = min(ex + 0.20, 3.0)
+                ms = min(ms + 0.10, 1.50); ma = min(ma + 0.05, 0.60)
+                vr = min(vr + 0.10, 2.0);  ex = min(ex + 0.20, 3.0)
             elif rate > 0.70:
-                ms = max(ms - 0.10, 0.30)
-                ma = max(ma - 0.05, 0.05)
-                vr = max(vr - 0.10, 1.0)
-                ex = max(ex - 0.20, 1.60)
+                ms = max(ms - 0.10, 0.30); ma = max(ma - 0.05, 0.05)
+                vr = max(vr - 0.10, 1.0);  ex = max(ex - 0.20, 1.60)
             else:
                 continue
 
@@ -327,34 +286,30 @@ def self_learning():
             thresholds["MIN_ACCEL_PM"] = round(ma, 2)
             thresholds["VOL_RATIO_MIN"] = round(vr, 2)
             thresholds["EXPECTED_MIN"]  = round(ex, 2)
-
-            if DEBUG_LOG:
-                print("[ADAPT]", thresholds)
+            if DEBUG_LOG: print("[ADAPT]", thresholds)
         except Exception as e:
             if DEBUG_LOG:
                 print("[ADAPT][ERR]", type(e).__name__, str(e))
                 traceback.print_exc()
 
 # =========================
-# 🏁 تشغيل الخيوط تلقائيًا (متوافق مع Gunicorn)
+# 🏁 تشغيل مؤجّل للخيوط (بدون أخطاء تحميل)
 # =========================
 def start_all():
     global _started
-    if _started:
-        return
+    if _started: return
     _started = True
     Thread(target=collector,    daemon=True).start()
     Thread(target=predictor,    daemon=True).start()
     Thread(target=self_learning,daemon=True).start()
-    if DEBUG_LOG:
-        print("[BOOT] threads started")
-
-# شغّل عند الاستيراد + أكد قبل أول طلب
-start_all()
+    if DEBUG_LOG: print("[BOOT] threads started")
 
 @app.before_first_request
 def _kickoff_threads():
-    start_all()
+    try:
+        start_all()
+    except Exception as e:
+        print("[BOOT][ERR]", type(e).__name__, str(e))
 
 # =========================
 # 🌐 Webhook & Health
@@ -364,24 +319,18 @@ def telegram_webhook():
     data = request.json or {}
     msg = data.get("message") or {}
     text = (msg.get("text") or "").strip().lower()
-
-    if not text:
-        return "ok", 200
+    if not text: return "ok", 200
 
     if text in {"الملخص", "/summary"}:
         if not history_results:
             send_message("📊 لا توجد نتائج بعد.")
         else:
             total = len(history_results)
-            hits  = sum(1 for _,_,s,_,_ in history_results if "✅" in s)
+            hits  = sum(1 for *_, s, _, _ in history_results if "✅" in s)
             misses= total - hits
             rate  = (hits / total) * 100
-            lines = [
-                f"📊 الملخص (آخر {total} إشارة):",
-                f"أصابت: {hits} | خابت: {misses} | نجاح: {rate:.1f}%",
-                "",
-                "آخر 12 نتيجة:"
-            ]
+            lines = [f"📊 الملخص (آخر {total} إشارة):",
+                     f"أصابت: {hits} | خابت: {misses} | نجاح: {rate:.1f}%", "", "آخر 12 نتيجة:"]
             for ts, base, status, exp, act in list(history_results)[-12:]:
                 lines.append(f"{base}: {status} | متوقعة {exp:+.2f}% | فعلية {act:+.2f}%")
             send_message("\n".join(lines))
@@ -426,9 +375,8 @@ def statusz():
     }), 200
 
 # =========================
-# 🖥️ التشغيل المحلي فقط
+# 🖥️ تشغيل محلي فقط
 # =========================
 if __name__ == "__main__":
-    # على Railway استخدم Gunicorn:
-    # web: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+    start_all()  # محليًا
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
