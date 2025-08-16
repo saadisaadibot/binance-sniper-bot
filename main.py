@@ -515,22 +515,28 @@ def room_refresher():
             with lock:
                 ok_data = sum(1 for _, dq in prices.items() if dq and (dq[-1][0] - dq[0][0]) >= 300)
             if ok_data == 0:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
 
             top = top5m_from_histories(MAX_ROOM * 2)
             now = time.time()
             scored = []
             with lock:
                 for b in top:
-                    dq = prices.get(b); if not dq: continue
+                    dq = prices.get(b)
+                    if not dq:
+                        continue
                     scored.append((b, pct_change_from_lookback(dq, 300, now)))
+
             scored.sort(key=lambda x: x[1], reverse=True)
             selected = [b for b, _ in scored[:MAX_ROOM]]
 
             with lock:
                 app.config["WATCHLIST"] = set(selected)
+
             if DEBUG_LOG:
                 print(f"[ROOM] selected {len(selected)} symbols")
+
         except Exception as e:
             if DEBUG_LOG:
                 print("[ROOM][ERR]", type(e).__name__, str(e))
