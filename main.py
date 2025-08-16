@@ -538,6 +538,50 @@ def adapt_thresholds_every_n():
         print(f"[ADAPT N] total={total_closed} win_rate_last_{ADAPT_EVERY_N}={rate:.2%} "
               f"=> BASE_STEP_PCT={BASE_STEP_PCT} BASE_STRONG_SEQ={BASE_STRONG_SEQ}")
 
+def _snapshot_for(base):
+    with lock:
+        dq = list(prices.get(base) or [])
+    return dq
+
+def _check_now_reason(base):
+    now = time.time()
+    in_eur = base in set(symbols_all_eur)
+    dq = _snapshot_for(base)
+    have_data = len(dq) >= 3
+    r1m = pct_change_from_lookback(deque(dq), 60, now) if have_data else 0.0
+    r5m = pct_change_from_lookback(deque(dq), 300, now) if have_data else 0.0
+
+    # هل ضمن الغرفة؟
+    with lock:
+        room = set(app.config.get("WATCHLIST", set()))
+    in_room = base in room
+
+    # الرتبة الحالية (تقريبية من تاريخنا)
+    rank_map = global_rank_map() if have_data else {}
+    rank = rank_map.get(base, None)
+
+    # الحرارة والمعامل
+    compute_market_heat()
+    m = adaptive_multipliers()
+
+    # تحقق الأنماط
+    p1 = p10 = False
+    if have_data:
+        p1 = check_top1_pattern(dq, m)
+        p10 = (not p1) and check_top10_pattern(dq, m)
+
+    # فلاتر الإرسال
+    by_rank = (rank is not None and rank > RANK_FILTER)
+    cooldown_block = (base in last_alert_ts and (now - last_alert_ts[base] < ALERT_COOLDOWN_SEC))
+
+    return {
+        "in_eur": in_eur, "in_room": in_room, "have_data": have_data,
+        "r1m": r1m, "r5m": r5m, "rank": rank,
+        "pattern_top1": bool(p1), "pattern_top10": bool(p10),
+        "blocked_by_rank": bool(by_rank), "blocked_by_cooldown": bool(cooldown_block),
+        "heat": round(heat_ewma, 3), "multiplier": m
+    }
+
 # =========================
 # 🌐 Web & Telegram
 # =========================
@@ -664,6 +708,23 @@ def telegram_webhook():
         send_summary(); return "ok", 200
     if text in {"الضبط", "/status", "status", "الحالة", "/stats", "شو عم تعمل", "/شو_عم_تعمل"}:
         send_message(get_settings_summary()); return "ok", 200
+        # /why BEAM  أو  ليش BEAM
+    if text.startswith("/why") or text.startswith("ليش"):
+        sym = text.split()[-1].upper()
+        info = _check_now_reason(sym)
+        if not info["in_eur"]:
+            send_message(f"ℹ️ {sym}: ليست ضمن EUR في Bitvavo أو غير مدعومة.")
+        else:
+            msg = [
+                f"🔍 WHY {sym}:",
+                f"- in_room: {info['in_room']} | have_data: {info['have_data']}",
+                f"- r1m {info['r1m']:+.2f}% | r5m {info['r5m']:+.2f}%",
+                f"- rank: {info['rank']} / filter≤{RANK_FILTER}",
+                f"- patterns → top1: {info['pattern_top1']} | top10: {info['pattern_top10']}",
+                f"- heat {info['heat']:.2f} ⇒ m={info['multiplier']:.2f}",
+                f"- blocked: rank={info['blocked_by_rank']} | cooldown={info['blocked_by_cooldown']}"
+            ]
+            send_message("\n".join(msg))
     return "ok", 200
 
 # =========================
