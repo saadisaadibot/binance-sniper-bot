@@ -293,7 +293,7 @@ def self_learning():
                 traceback.print_exc()
 
 # =========================
-# 🏁 تشغيل مؤجّل للخيوط (بدون أخطاء تحميل)
+# 🏁 تشغيل مؤجّل للخيوط (Flask 3 compatible)
 # =========================
 def start_all():
     global _started
@@ -304,12 +304,13 @@ def start_all():
     Thread(target=self_learning,daemon=True).start()
     if DEBUG_LOG: print("[BOOT] threads started")
 
-@app.before_first_request
-def _kickoff_threads():
-    try:
-        start_all()
-    except Exception as e:
-        print("[BOOT][ERR]", type(e).__name__, str(e))
+@app.before_request
+def _ensure_threads():
+    if not _started:
+        try:
+            start_all()
+        except Exception as e:
+            print("[BOOT][ERR]", type(e).__name__, str(e))
 
 # =========================
 # 🌐 Webhook & Health
@@ -379,4 +380,4 @@ def statusz():
 # =========================
 if __name__ == "__main__":
     start_all()  # محليًا
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT, 8080").split(",")[0]))
