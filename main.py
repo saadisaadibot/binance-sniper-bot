@@ -1,114 +1,114 @@
 # -*- coding: utf-8 -*-
-import os, time, json, math, random, traceback, requests
+import os, time, math, random, requests, traceback
 from collections import deque, defaultdict
 from threading import Thread, Lock, Event
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
 # =========================
-# 🚀 إعداد
+# Boot
 # =========================
 load_dotenv()
 app = Flask(__name__)
 
+# =========================
+# ⚙️ الإعدادات (قابلة للتعديل عبر .env)
+# =========================
 BASE_URL             = os.getenv("BITVAVO_URL", "https://api.bitvavo.com/v2")
 HTTP_TIMEOUT         = float(os.getenv("HTTP_TIMEOUT", 8.0))
 
-# سحب الأسعار والاختيار
-SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 5))          # كل كم ثانية نسحب السعر اللحظي
-MARKETS_REFRESH_SEC  = int(os.getenv("MARKETS_REFRESH_SEC", 60))   # تحديث قائمة أسواق EUR
-ROOM_SIZE            = int(os.getenv("ROOM_SIZE", 40))             # عدد العملات اللي نكوّن لها شمعات
-RESELECT_MINUTES     = int(os.getenv("RESELECT_MINUTES", 15))      # إعادة انتقاء “البارزين” كل ربع ساعة
+SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 5))           # سحب الأسعار (ث)
+MARKETS_REFRESH_SEC  = int(os.getenv("MARKETS_REFRESH_SEC", 60))    # تحديث قائمة الأسواق
+MAX_ROOM             = int(os.getenv("MAX_ROOM", 24))               # حجم غرفة المراقبة
+RESELECT_EVERY_SEC   = int(os.getenv("RESELECT_EVERY_SEC", 180))    # إعادة انتقاء الغرفة
 
-# اختيار البارزين من آخر 30 دقيقة
-VOL30_MIN_PCT        = float(os.getenv("VOL30_MIN_PCT", 2.0))      # لازم تغيّر ≥ 2% خلال 30د ليتم مراقبته
-TOP_VOL_KEEP         = int(os.getenv("TOP_VOL_KEEP", 20))          # نحصر المراقبة لأكثر العملات تقلبًا
+RANK_FILTER          = int(os.getenv("RANK_FILTER", 10))            # لا إشعار إلا إذا ضمن Top N
 
-# منطق الدخول/الخروج (افتراضيًا Long فقط)
-TARGET_PCT           = float(os.getenv("TARGET_PCT", 2.0))         # نعتبر الصفقة ناجحة عند +2%
-STOP_PCT             = float(os.getenv("STOP_PCT", 1.0))           # ستوب مبكر اختياري
-FOLLOWUP_WINDOW_SEC  = int(os.getenv("FOLLOWUP_WINDOW_SEC", 600))  # نغلق بعد 10د إن ما وصل الهدف
-MIN_BREAKOUT_PCT     = float(os.getenv("MIN_BREAKOUT_PCT", 0.6))   # اختراق بسيط فوق قمة 5د (حوالي 0.6%+)
-MAX_PULLBACK_PCT     = float(os.getenv("MAX_PULLBACK_PCT", 0.5))   # ارتداد مسموح بعد الاختراق
+# أنماط الإشارة الأساسية
+BASE_STEP_PCT        = float(os.getenv("BASE_STEP_PCT", 1.0))       # top10: 1% + 1%
+BASE_STRONG_SEQ      = os.getenv("BASE_STRONG_SEQ", "2,1,2")        # top1: 2 ثم 1 ثم 2 %
+SEQ_WINDOW_SEC       = int(os.getenv("SEQ_WINDOW_SEC", 300))        # نافذة النمط القوي
+STEP_WINDOW_SEC      = int(os.getenv("STEP_WINDOW_SEC", 180))       # نافذة 1% + 1%
 
-# منع السيل/التكرار
-ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", 600))   # كولداون لكل عملة
-FLOOD_WINDOW_SEC     = int(os.getenv("FLOOD_WINDOW_SEC", 30))
-FLOOD_MAX_PER_WINDOW = int(os.getenv("FLOOD_MAX_PER_WINDOW", 10))
-DEDUP_SEC            = int(os.getenv("DEDUP_SEC", 5))
-
-# حرارة + اتجاه
+# حرارة السوق
 HEAT_LOOKBACK_SEC    = int(os.getenv("HEAT_LOOKBACK_SEC", 120))
 HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))
 HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))
 
+# متابعة 10 دقائق (أعلى قمة)
+FOLLOWUP_WINDOW_SEC  = int(os.getenv("FOLLOWUP_WINDOW_SEC", 600))   # 10 دقائق
+TARGET_PCT           = float(os.getenv("TARGET_PCT", 2.0))          # نجاح عند أفضل قمة ≥ +2%
+
+# مضاد السيل/التكرار
+ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", 420))    # كولداون لكل عملة
+FLOOD_WINDOW_SEC     = int(os.getenv("FLOOD_WINDOW_SEC", 30))
+FLOOD_MAX_PER_WINDOW = int(os.getenv("FLOOD_MAX_PER_WINDOW", 12))
+DEDUP_SEC            = int(os.getenv("DEDUP_SEC", 5))
+
+# إحماء
+GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 15))
+
+# حدود أمان للتكيّف كل N
+ADAPT_EVERY_N        = int(os.getenv("ADAPT_EVERY_N", 10))
+ADAPT_WIN_LOW        = float(os.getenv("ADAPT_WIN_LOW", 0.40))
+ADAPT_WIN_HIGH       = float(os.getenv("ADAPT_WIN_HIGH", 0.70))
+STEP_MIN, STEP_MAX   = float(os.getenv("STEP_MIN", 0.6)), float(os.getenv("STEP_MAX", 2.0))
+SEQ0_MIN, SEQ0_MAX   = float(os.getenv("SEQ0_MIN", 1.2)), float(os.getenv("SEQ0_MAX", 3.2))
+
 # تيليجرام
 BOT_TOKEN            = os.getenv("BOT_TOKEN")
 CHAT_ID              = os.getenv("CHAT_ID")
-EXPERIMENT_TAG       = os.getenv("EXPERIMENT_TAG", "جرب لتفهم")
 
-# Redis اختياري
-REDIS_URL            = os.getenv("REDIS_URL")
-
+# لوج
 DEBUG_LOG            = os.getenv("DEBUG_LOG", "0") == "1"
 STATS_EVERY_SEC      = int(os.getenv("STATS_EVERY_SEC", 60))
-GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 20))
 
 # =========================
-# 🧠 حالة
+# 🧠 الحالة
 # =========================
 lock = Lock()
 started = Event()
 
-symbols_eur = []
+symbols_all_eur = []                         # كل الأزواج مقابل EUR
 last_markets_refresh = 0
+start_time = time.time()
 
-# أسعار خام (ثوانٍ) + شمعات 1 دقيقة محليًا
-ticks = defaultdict(lambda: deque())                 # base -> deque[(ts, price)] (احتفاظ ~35د)
-candles = defaultdict(lambda: dict())                # base -> {minute_ts -> [o,h,l,c]}
-minute_order = defaultdict(lambda: deque(maxlen=60)) # ترتيب آخر 60 دقيقة لكل base
+# تدفّق لحظي  (ثواني ~ 20 دقيقة)
+prices = defaultdict(lambda: deque())        # base -> deque[(ts, price)]
 
-# Redis (اختياري)
-r = None
-if REDIS_URL:
-    try:
-        import redis as _redis
-        r = _redis.from_url(REDIS_URL)
-    except Exception:
-        r = None
+# شموع 1 دقيقة (لـ 90 دقيقة)
+candles = defaultdict(lambda: dict())        # base -> {minute:int -> (o,h,l,c)}
+minute_order = defaultdict(lambda: deque(maxlen=120))  # ترتيب المفاتيح
+last_snapshot_minute = -1
 
-# مراقبة + تداول افتراضي
-watchlist = set()                                    # عملات “بارزة” (تقلب ≥ 2% خلال 30د)
-last_quarter_minute = -1
-
-open_trades = {}                                     # base -> dict(entry_ts, entry_px, high_px, reason, bias, status)
-last_alert_ts = {}                                   # كولداون لكل عملة
-
-# تتبّع + تعلّم
-history = deque(maxlen=1000)                         # [(ts, base, status, best%, reason, ctx)]
-coin_perf = defaultdict(lambda: deque(maxlen=30))    # base -> 'hit'/'miss'
+# حرارة سوق
 heat_ewma = 0.0
+latest_price_map = {}
 last_bulk_ts = 0
 
-# Flood/Dedup
-from collections import deque as _dq
-flood_times = _dq()
+# حالة الأنماط و الإشعارات
+pattern_state = defaultdict(lambda: {"top1": False, "top10": False})
+last_alert_ts = {}
+from collections import deque as _deque
+flood_times = _deque()
 last_msg = {"text": None, "ts": 0.0}
 
-# =========================
-# 🔌 مساعدات
-# =========================
-def send_message(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("[TG_DISABLED]", text); return
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text}, timeout=HTTP_TIMEOUT)
-    except Exception as e:
-        print("Telegram error:", e)
+# متابعة 10 دقائق
+open_preds = {}           # base -> dict(time, start_price, high_price, tag, hour_change, status)
+history_results = deque(maxlen=1000)
+learning_window = deque(maxlen=60)
+last_adapt_total = 0
 
+# خطوط أساس إحصائية (يتم تحديثها كل دقيقة)
+PCTL_R1M = 0.25
+PCTL_ACCEL = 0.10
+PCTL_RNG3 = 0.80
+
+# =========================
+# 🛰️ HTTP
+# =========================
 def http_get(url, params=None, timeout=HTTP_TIMEOUT):
-    headers = {"User-Agent": "try-to-understand/1.0"}
+    headers = {"User-Agent": "signals-final/1.0"}
     for _ in range(2):
         try:
             return requests.get(url, params=params, timeout=timeout, headers=headers)
@@ -116,344 +116,352 @@ def http_get(url, params=None, timeout=HTTP_TIMEOUT):
             time.sleep(0.4)
     return None
 
+# =========================
+# Utilities
+# =========================
 def pct(a, b):
     try:
-        return (a - b) / b * 100.0 if (b and b > 0) else 0.0
+        return (a - b) / b * 100.0 if b else 0.0
     except Exception:
         return 0.0
 
+def calc_percentile(values, p):
+    if not values:
+        return 0.0
+    v = sorted(values)
+    k = max(0, min(len(v) - 1, int(round(p * (len(v) - 1)))))
+    return v[k]
+
 # =========================
-# 📈 أسواق وأسعار
+# أسواق EUR + Bulk ticker
 # =========================
 def refresh_markets(now=None):
-    global symbols_eur, last_markets_refresh
+    global symbols_all_eur, last_markets_refresh
     now = now or time.time()
-    if (now - last_markets_refresh) < MARKETS_REFRESH_SEC and symbols_eur:
+    if (now - last_markets_refresh) < MARKETS_REFRESH_SEC and symbols_all_eur:
         return
     resp = http_get(f"{BASE_URL}/markets")
-    if not resp or resp.status_code != 200: return
+    if not resp or resp.status_code != 200:
+        return
     try:
         data = resp.json()
-        symbols_eur = [m.get("base") for m in data
-                       if m.get("quote") == "EUR" and m.get("status") == "trading"
-                       and (m.get("base") or "").isalpha()]
+        symbols_all_eur = [
+            m.get("base") for m in data
+            if m.get("quote") == "EUR" and m.get("status") == "trading" and (m.get("base") or "").isalpha()
+        ]
         last_markets_refresh = now
-        if DEBUG_LOG: print(f"[MARKETS] {len(symbols_eur)} EUR symbols")
+        if DEBUG_LOG:
+            print(f"[MARKETS] EUR symbols: {len(symbols_all_eur)}")
     except Exception:
         pass
 
 def bulk_prices():
     resp = http_get(f"{BASE_URL}/ticker/price")
     out = {}
-    if not resp or resp.status_code != 200: return out
+    if not resp or resp.status_code != 200:
+        return out
     try:
         for row in resp.json():
-            mk = row.get("market","")
+            mk = row.get("market", "")
             if mk.endswith("-EUR"):
                 base = mk.split("-")[0]
-                try: out[base] = float(row["price"])
-                except: continue
+                try:
+                    out[base] = float(row["price"])
+                except Exception:
+                    continue
     except Exception:
         pass
     return out
 
 # =========================
-# 🕯️ صناعة شمعات 1 دقيقة + حفظ Redis
+# 🔥 حرارة السوق
 # =========================
-def push_tick_update(mp, now):
-    minute = int(now // 60) * 60
-    cutoff_ticks = now - 35*60
-
-    for base, px in mp.items():
-        dq = ticks[base]
-        dq.append((now, px))
-        while dq and dq[0][0] < cutoff_ticks: dq.popleft()
-
-        cinfo = candles[base].get(minute)
-        if cinfo is None:
-            candles[base][minute] = [px, px, px, px]   # o,h,l,c
-            minute_order[base].append(minute)
-        else:
-            o,h,l,c = cinfo
-            candles[base][minute] = [o, max(h,px), min(l,px), px]
-
-    # تنظيف شمعات أقدم من 60 دقيقة
-    for base in list(candles.keys()):
-        while minute_order[base] and (minute - minute_order[base][0]) > 60*60:
-            oldm = minute_order[base].popleft()
-            candles[base].pop(oldm, None)
-
-    # إلى Redis (آخر 30 دقيقة فقط)
-    if r:
-        try:
-            for base in list(candles.keys()):
-                mins = list(minute_order[base])[-30:]
-                arr = []
-                for m in mins:
-                    o,h,l,c = candles[base][m]
-                    arr.append([m, o,h,l,c])
-                r.set(f"ohlc:{base}", json.dumps(arr))
-        except Exception:
-            pass
-
-# =========================
-# 🌡️ حرارة السوق + اتجاه متعدد النوافذ
-# =========================
-def compute_heat():
+def compute_market_heat():
     global heat_ewma
     now = time.time()
     moved = total = 0
     with lock:
-        for base, dq in ticks.items():
+        for base, dq in prices.items():
             if len(dq) < 2: continue
-            ref = None
+            old = None
             for ts, pr in reversed(dq):
-                if now - ts >= HEAT_LOOKBACK_SEC: ref = pr; break
-            if ref and ref>0:
+                if now - ts >= HEAT_LOOKBACK_SEC:
+                    old = pr; break
+            if old and old > 0:
                 cur = dq[-1][1]
-                ret = pct(cur, ref)
+                ret = (cur - old) / old * 100.0
                 total += 1
-                if abs(ret) >= HEAT_RET_PCT: moved += 1
-    raw = (moved/total) if total else 0.0
+                if abs(ret) >= HEAT_RET_PCT:
+                    moved += 1
+    raw = (moved / total) if total else 0.0
     if total:
-        heat_ewma = (1-HEAT_SMOOTH)*heat_ewma + HEAT_SMOOTH*raw
+        heat_ewma = (1 - HEAT_SMOOTH) * heat_ewma + HEAT_SMOOTH * raw
     return heat_ewma
 
-def dir_bias(base):
-    """انحياز اتجاهي من 1/5/15/60 دقيقة."""
+def adaptive_multipliers():
+    h = max(0.0, min(1.0, heat_ewma))
+    if h < 0.15:   return 0.75
+    if h < 0.35:   return 0.9
+    if h < 0.60:   return 1.0
+    return 1.25
+
+# =========================
+# بناء شموع 1 دقيقة + r5m + ترتيب
+# =========================
+def pct_change_from_lookback(dq, lookback_sec, now):
+    if not dq: return 0.0
+    cur = dq[-1][1]
+    old = None
+    for ts, pr in reversed(dq):
+        if now - ts >= lookback_sec:
+            old = pr; break
+    return pct(cur, old) if old else 0.0
+
+def top5m_from_histories(limit):
     now = time.time()
-    mins = list(minute_order[base])
-    if len(mins) < 3:
-        return {"bias":1.0,"r5":0.0,"r15":0.0,"r60":0.0}
-    def close_at(min_ts):
-        o,h,l,c = candles[base].get(min_ts, [None]*4)
-        return c
-    last_m = mins[-1]
-    c_now = close_at(last_m)
-    def ch(lb):
-        target = last_m - lb
-        ref = None
-        for m in reversed(mins):
-            if m <= target:
-                ref = close_at(m); break
-        return pct(c_now, ref) if (ref and ref>0) else 0.0
-    r5, r15, r60 = ch(300), ch(900), ch(3600)
-
-    score = 0
-    for v,w in [(r5,1.5),(r15,1.2),(r60,0.8)]:
-        score += (1 if v>0 else -1 if v<0 else 0)*w
-    bias = 0.92 if score>=2.0 else (1.08 if score<=-2.0 else 1.0)
-    return {"bias":bias,"r5":r5,"r15":r15,"r60":r60}
-
-def noise_regime(base):
-    """قياس ضجيج آخر 3 دقائق ضمنياً من تذبذب الشموع."""
-    mins = list(minute_order[base])[-4:]
-    if len(mins) < 3: return "normal"
-    closes = [candles[base][m][3] for m in mins]
-    diffs = []
-    for i in range(1,len(closes)):
-        if closes[i-1] > 0:
-            diffs.append(abs(pct(closes[i], closes[i-1])))
-    vol = sum(diffs)/len(diffs) if diffs else 0.0
-    if vol < 0.05:  return "flat"
-    if vol > 0.90:  return "choppy"
-    return "normal"
-
-# =========================
-# 🧮 اختيار “البارزين” (آخر 30د)
-# =========================
-def calc_vol30(base):
-    mins = list(minute_order[base])[-30:]
-    if len(mins) < 5: return 0.0, 0.0
-    highs = [candles[base][m][1] for m in mins]
-    lows  = [candles[base][m][2] for m in mins]
-    mx, mn = max(highs), min(lows)
-    if mn <= 0: return 0.0, 0.0
-    amp = pct(mx, mn)         # اتساع 30 دقيقة
-    net = pct(candles[base][mins[-1]][3], candles[base][mins[0]][0])  # صافي الحركة
-    return amp, net
-
-def reselect_watchlist(now=None):
-    global watchlist, last_quarter_minute
-    now = now or time.time()
-    cur_min = int(now//60)
-    # نفذ كل ربع ساعة
-    if cur_min % RESELECT_MINUTES == 0 and cur_min != last_quarter_minute:
-        last_quarter_minute = cur_min
-        candidates = []
-        with lock:
-            bases = symbols_eur or list(candles.keys())
-            for b in bases:
-                if not minute_order[b]: continue
-                amp, net = calc_vol30(b)
-                if amp >= VOL30_MIN_PCT:
-                    candidates.append((b, amp, net))
-        # اختَر الأكثر تقلبًا
-        candidates.sort(key=lambda x: (x[1], abs(x[2])), reverse=True)
-        selected = [b for b,_,__ in candidates[:TOP_VOL_KEEP]]
-        with lock:
-            watchlist = set(selected)
-        if DEBUG_LOG:
-            print(f"[RESELECT] watch {len(watchlist)} / cand={len(candidates)}")
-
-# =========================
-# 🎯 منطق الدخول/الخروج
-# =========================
-def can_enter_long(base):
-    """اختراق قمة 5د + انحياز الاتجاه/الضجيج يعدّل الشروط."""
-    mins = list(minute_order[base])
-    if len(mins) < 8: return None
-    last = mins[-1]
-    last_c = candles[base][last][3]
-
-    # قمة آخر 5 دقائق بدون الشمعة الحالية
-    prev5 = [candles[base][m][3] for m in mins[-6:-1]]
-    if not prev5 or min(prev5) <= 0: return None
-    prev_max = max(prev5)
-
-    # انحيازات
-    bias = dir_bias(base)
-    reg  = noise_regime(base)
-    heat = compute_heat()
-    m = 1.0 * bias["bias"]
-    if reg == "flat":   m *= 1.08
-    elif reg == "choppy": m *= 0.96
-    if heat < 0.1:      m *= 1.05
-    if heat > 0.5:      m *= 0.97
-
-    # شرط الاختراق
-    breakout = pct(last_c, prev_max)
-    need = MIN_BREAKOUT_PCT * m
-    if breakout < need:
-        return None
-
-    # لا يكون هناك ارتداد قوي في الشمعة الحالية
-    last_o, last_h, last_l, last_c = candles[base][last]
-    pullbk = pct(last_c, last_h)  # عادة <= 0
-    if pullbk <= -MAX_PULLBACK_PCT * m:
-        return None
-
-    ctx = {
-        "bias": bias,
-        "heat": heat,
-        "reg": reg,
-        "need_breakout": need,
-        "breakout": breakout
-    }
-    return ctx
-
-def try_open_trades():
-    """جرّب فتح دخول Long افتراضي على العملات المراقبة."""
-    now = time.time()
+    rows = []
     with lock:
-        bases = list(watchlist)
+        bases = list(symbols_all_eur) if symbols_all_eur else list(prices.keys())
+        for base in bases:
+            dq = prices.get(base)
+            if not dq: continue
+            r5m = pct_change_from_lookback(dq, 300, now)
+            rows.append((base, r5m))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [b for b, _ in rows[:limit]]
+
+def global_rank_map():
+    now = time.time()
+    rows = []
+    with lock:
+        for base, dq in prices.items():
+            if not dq: continue
+            r5m = pct_change_from_lookback(dq, 300, now)
+            rows.append((base, r5m))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return {b: i+1 for i, (b, _) in enumerate(rows)}
+
+def one_min_returns(base):
+    mins = list(minute_order[base])
+    if len(mins) < 2: return []
+    rets = []
+    for i in range(1, len(mins)):
+        c_now = candles[base][mins[i]][3]
+        c_prev= candles[base][mins[i-1]][3]
+        if c_prev: rets.append(pct(c_now, c_prev))
+    return rets
+
+# =========================
+# خطوط أساس إحصائية (تُحدَّث كل دقيقة)
+# =========================
+def refresh_baselines():
+    global PCTL_R1M, PCTL_ACCEL, PCTL_RNG3
+    with lock:
+        bases = list(app.config.get("WATCHLIST", set())) or list(candles.keys())
+    r1_list, accel_list, range3_list = [], [], []
     for b in bases:
-        # كولداون
-        if b in last_alert_ts and now - last_alert_ts[b] < ALERT_COOLDOWN_SEC:
+        mins = list(minute_order[b])
+        if len(mins) < 6:
             continue
-        if b in open_trades:   # صفقة مفتوحة
-            continue
-        ctx = can_enter_long(b)
-        if not ctx:
-            continue
-        # افتح
-        last_m = minute_order[b][-1]
-        entry_px = candles[b][last_m][3]
-        open_trades[b] = {
-            "entry_ts": now, "entry_px": entry_px, "high_px": entry_px,
-            "ctx": ctx, "status": None
+        r1 = one_min_returns(b)
+        if len(r1) >= 2:
+            r1_list += r1[-10:]
+            accel_list += [r1[-1] - r1[-2]]
+        prev3 = mins[-4:-1]
+        if len(prev3) == 3:
+            highs = [candles[b][m][1] for m in prev3]
+            lows  = [candles[b][m][2] for m in prev3]
+            if min(lows) > 0:
+                range3_list.append(pct(max(highs), min(lows)))
+    PCTL_R1M  = calc_percentile(r1_list, 0.90) or 0.25
+    PCTL_ACCEL= calc_percentile(accel_list, 0.80) or 0.10
+    PCTL_RNG3 = calc_percentile(range3_list, 0.90) or 0.80
+
+# =========================
+# الأنماط (top10/top1) – تعمل على تدفق الثواني
+# =========================
+def check_top10_pattern(dq_snapshot, m):
+    thresh = BASE_STEP_PCT * m
+    if len(dq_snapshot) < 3: return False
+    now = dq_snapshot[-1][0]
+    window = [(ts, p) for ts, p in dq_snapshot if now - ts <= STEP_WINDOW_SEC]
+    if len(window) < 3: return False
+    for i in range(len(window) - 2):
+        p0 = window[i][1]; step1 = False; last_p = p0
+        for j in range(i+1, len(window)):
+            pr = window[j][1]
+            ch1 = pct(pr, p0)
+            if not step1 and ch1 >= thresh:
+                step1 = True; last_p = pr; continue
+            if step1:
+                ch2 = pct(pr, last_p)
+                if ch2 >= thresh: return True
+                if pct(pr, last_p) <= -thresh: break
+    return False
+
+def check_top1_pattern(dq_snapshot, m):
+    seq_parts = [float(x.strip()) for x in BASE_STRONG_SEQ.split(",") if x.strip()]
+    if not seq_parts or len(dq_snapshot) < 3: return False
+    seq_parts = [x * m for x in seq_parts]
+    now = dq_snapshot[-1][0]
+    window = [(ts, p) for ts, p in dq_snapshot if now - ts <= SEQ_WINDOW_SEC]
+    if len(window) < 3: return False
+    slack = 0.3 * m
+    for i in range(len(window) - 2):
+        base_p = window[i][1]; peak_after_step = base_p; step_i = 0
+        for j in range(i+1, len(window)):
+            pr = window[j][1]
+            ch = pct(pr, base_p)
+            need = seq_parts[step_i]
+            if ch >= need:
+                step_i += 1; base_p = pr; peak_after_step = pr
+                if step_i == len(seq_parts): return True
+            else:
+                if peak_after_step > 0 and pct(pr, peak_after_step) <= -slack:
+                    break
+    return False
+
+# =========================
+# مشغلات دخول خفيفة (تعتمد شموع الدقيقة + الأساسات الإحصائية)
+# =========================
+MIN_BREAKOUT_PCT = float(os.getenv("MIN_BREAKOUT_PCT", 0.3))
+MAX_PULLBACK_PCT = float(os.getenv("MAX_PULLBACK_PCT", 0.5))
+
+def can_enter_long(base):
+    """يدخل إذا تحقق أحد: Momentum Burst / Breakout-Lite / Fast Bounce."""
+    mins = list(minute_order[base])
+    if len(mins) < 8:
+        return None
+
+    last_m = mins[-1]
+    o, h, l, c = candles[base][last_m]
+    if not c: return None
+
+    # أساسات السوق الآن
+    P_R1, P_ACC, P_RNG3 = PCTL_R1M, PCTL_ACCEL, PCTL_RNG3
+
+    r1 = one_min_returns(base)
+    r1m_now = r1[-1] if r1 else 0.0
+    accel   = (r1[-1]-r1[-2]) if len(r1) >= 2 else 0.0
+
+    # مبدّل بسيط حسب الحرارة
+    m = adaptive_multipliers()
+
+    # 1) Momentum Burst
+    trig_momo = (r1m_now >= P_R1*m) and (accel >= P_ACC*0.9)
+
+    # 2) Breakout-Lite عبر أعلى إغلاق 3د مع سحب بسيط
+    trig_bo = False
+    prev3 = mins[-4:-1]
+    if len(prev3) == 3:
+        prev_max_close = max(candles[base][m_][3] for m_ in prev3)
+        breakout = pct(c, prev_max_close) if prev_max_close else 0.0
+        pullbk   = pct(c, h)  # ≤ 0
+        need_bo  = max(MIN_BREAKOUT_PCT, 0.3 * (P_RNG3/1.0)) * m
+        trig_bo  = (breakout >= need_bo) and (pullbk > -MAX_PULLBACK_PCT)
+
+    # 3) Fast Bounce: هبوط 3د قوي ثم تعافٍ دقيقتين
+    trig_bounce = False
+    if len(prev3) == 3:
+        highs = [candles[base][m_][1] for m_ in prev3]
+        lows  = [candles[base][m_][2] for m_ in prev3]
+        if min(lows) > 0:
+            drop3 = pct(min(lows), max(highs))  # سالبة
+            if drop3 <= -1.2:
+                last2 = mins[-3:-1]
+                c1 = candles[base][last2[0]][3]; c2 = candles[base][last2[1]][3]
+                if c1 and c2 and c2 >= c1 and r1m_now > 0:
+                    trough = min(lows); recov = pct(c, trough)
+                    trig_bounce = recov >= 0.4
+
+    if trig_momo or trig_bo or trig_bounce:
+        return {
+            "r1m_now": r1m_now, "accel": accel,
+            "triggers": {"momo": trig_momo, "bo": trig_bo, "bounce": trig_bounce},
+            "need_r1": P_R1*m, "need_acc": P_ACC*0.9
         }
-        last_alert_ts[b] = now
-        # رسالة “دخلنا”
-        arrow = "↗️" if ctx["bias"]["r15"] >= 0 else "↘️"
-        msg = (f"🧪 {EXPERIMENT_TAG}\n"
-               f"دخلنا: {b} (long)\n"
-               f"مدخل: {entry_px:.8f} | هدف: +{TARGET_PCT:.2f}% | نافذة: 10د\n"
-               f"الاتجاه 15د {ctx['bias']['r15']:+.2f}% {arrow} | heat {ctx['heat']:.2f}\n"
-               f"breakout {ctx['breakout']:+.2f}% ≥ need {ctx['need_breakout']:.2f}%")
-        flood_and_send(msg)
+    return None
 
-def manage_trades():
-    """تحديث القمة + الخروج نجاح/فشل + تعليل."""
+# =========================
+# تيليجرام + متابعة
+# =========================
+def send_message(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        print(f"[TG_DISABLED] {text}")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text},
+            timeout=HTTP_TIMEOUT
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+def notify_signal(base, tag, rank_map, extra=""):
     now = time.time()
-    to_close = []
-    for b, tr in list(open_trades.items()):
-        # تحديث أعلى قمة
-        last_m = minute_order[b][-1] if minute_order[b] else None
-        if not last_m: continue
-        cur = candles[b][last_m][3]
-        if cur > tr["high_px"]: tr["high_px"] = cur
-
-        ret_best = pct(tr["high_px"], tr["entry_px"])
-        ret_now  = pct(cur, tr["entry_px"])
-        elapsed  = now - tr["entry_ts"]
-
-        # نجاح مبكر
-        if ret_best >= TARGET_PCT:
-            tr["status"] = ("✅ أصابت", ret_best, "hit_target")
-        # فشل مبكر (ستوب اختياري)
-        elif ret_now <= -STOP_PCT:
-            tr["status"] = ("❌ خابت", ret_best, "stop_loss")
-        # انتهاء المهلة
-        elif elapsed >= FOLLOWUP_WINDOW_SEC:
-            reason = classify_fail_reason(b, tr, ret_best, ret_now)
-            status = "✅ أصابت" if ret_best >= TARGET_PCT else "❌ خابت"
-            tr["status"] = (status, ret_best, reason)
-
-        if tr["status"] is not None:
-            status, best, reason = tr["status"]
-            ctx = tr.get("ctx", {})
-            history.append((now, b, status, best, reason, ctx))
-            coin_perf[b].append("hit" if "✅" in status else "miss")
-            to_close.append(b)
-
-            # رسالة خروج
-            msg = (f"🧪 {EXPERIMENT_TAG}\n"
-                   f"خروج: {b} => {status}\n"
-                   f"أفضل عائد خلال 10د: {best:+.2f}%\n"
-                   f"السبب: {reason}")
-            flood_and_send(msg)
-
-    for b in to_close:
-        open_trades.pop(b, None)
-
-def classify_fail_reason(base, tr, best, cur_ret):
-    """تعليل بسيط يفيد التعلم."""
-    ctx = tr.get("ctx", {})
-    reg = ctx.get("reg", "normal")
-    bias = ctx.get("bias", {})
-    r15 = bias.get("r15", 0.0)
-    heat = ctx.get("heat", 0.0)
-
-    if best < 0.5:
-        return "no_follow_through"
-    if r15 < -0.3:
-        return "against_trend_15m"
-    if reg == "choppy":
-        return "high_noise_regime"
-    if heat < 0.1:
-        return "cold_market"
-    if cur_ret < -0.6:
-        return "sharp_reversal"
-    return "time_expired"
-
-def flood_and_send(text):
-    now = time.time()
+    # كولداون لكل عملة
+    if base in last_alert_ts and now - last_alert_ts[base] < ALERT_COOLDOWN_SEC:
+        return
+    # رتبة
+    rank = rank_map.get(base, 999)
+    if rank > RANK_FILTER:
+        return
+    # Flood control
     while flood_times and now - flood_times[0] > FLOOD_WINDOW_SEC:
         flood_times.popleft()
     if len(flood_times) >= FLOOD_MAX_PER_WINDOW:
         return
-    if last_msg["text"] == text and (now - last_msg["ts"]) < DEDUP_SEC:
+
+    # سجل متابعة
+    with lock:
+        dq = prices.get(base)
+        if not dq: return
+        start_price = dq[-1][1]
+        open_preds[base] = {
+            "time": now, "start_price": start_price, "high_price": start_price,
+            "tag": tag, "hour_change": None, "status": None
+        }
+
+    msg = f"🔔 تنبؤ: {base} {tag} #top{rank}{(' ' + extra) if extra else ''}"
+
+    if last_msg["text"] == msg and (now - last_msg["ts"]) < DEDUP_SEC:
         return
+    last_alert_ts[base] = now
     flood_times.append(now)
-    last_msg["text"], last_msg["ts"] = text, now
-    send_message(text)
+    last_msg["text"], last_msg["ts"] = msg, now
+    send_message(msg)
+
+def evaluate_open_predictions():
+    now = time.time()
+    to_close = []
+    with lock:
+        for base, pred in list(open_preds.items()):
+            if pred["status"] is not None:
+                continue
+            dq = prices.get(base)
+            if not dq: continue
+            cur = dq[-1][1]
+            if cur > pred["high_price"]:
+                pred["high_price"] = cur
+            if now - pred["time"] >= FOLLOWUP_WINDOW_SEC:
+                best_change = pct(pred["high_price"], pred["start_price"])
+                status = "✅ أصابت" if best_change >= TARGET_PCT else "❌ خابت"
+                pred["status"] = status
+                history_results.append((
+                    now, base, pred["tag"], status, TARGET_PCT, best_change, None
+                ))
+                learning_window.append("hit" if "✅" in status else "miss")
+                to_close.append(base)
+        for b in to_close:
+            open_preds.pop(b, None)
 
 # =========================
 # 🔁 العمال
 # =========================
 def price_poller():
-    global last_bulk_ts
+    """Bulk fetch + تحديث تدفق الثواني + بناء شموع 1-دقيقة."""
+    global latest_price_map, last_bulk_ts, last_snapshot_minute
     last_stats, misses = 0, 0
     while True:
         try:
@@ -462,16 +470,38 @@ def price_poller():
             now = time.time()
             if mp:
                 with lock:
-                    push_tick_update(mp, now)
+                    latest_price_map = mp
                     last_bulk_ts = now
+                    minute = int(now // 60)
+                    for base, price in mp.items():
+                        if symbols_all_eur and base not in symbols_all_eur:
+                            continue
+                        # تدفق 20 دقيقة
+                        dq = prices[base]
+                        dq.append((now, price))
+                        cutoff = now - 1200
+                        while dq and dq[0][0] < cutoff:
+                            dq.popleft()
+                        # شمعة الدقيقة
+                        if minute not in candles[base]:
+                            candles[base][minute] = [price, price, price, price]  # o,h,l,c
+                            minute_order[base].append(minute)
+                        else:
+                            o, h, l, _c = candles[base][minute]
+                            h = max(h, price); l = min(l, price); c = price
+                            candles[base][minute] = [o, h, l, c]
+                    # تحديث خطوط الأساس كل دقيقة
+                    if minute != last_snapshot_minute:
+                        refresh_baselines()
+                        last_snapshot_minute = minute
             else:
                 misses += 1
 
             if DEBUG_LOG and (time.time() - last_stats) >= STATS_EVERY_SEC:
                 last_stats = time.time()
                 with lock:
-                    with_data = sum(1 for _, v in ticks.items() if v)
-                print(f"[POLL] ticks={with_data} markets={len(symbols_eur)} misses={misses}")
+                    with_data = sum(1 for _, v in prices.items() if v)
+                print(f"[POLL] entries={with_data} markets={len(symbols_all_eur)} misses={misses} heat={heat_ewma:.2f}")
                 misses = 0
         except Exception as e:
             if DEBUG_LOG:
@@ -479,106 +509,226 @@ def price_poller():
                 traceback.print_exc()
         time.sleep(SCAN_INTERVAL)
 
-def selector_and_trader():
+def room_refresher():
     while True:
         try:
-            if time.time() - last_bulk_ts > 15:  # ما في بيانات
-                time.sleep(1); continue
+            with lock:
+                ok_data = sum(1 for _, dq in prices.items() if dq and (dq[-1][0] - dq[0][0]) >= 300)
+            if ok_data == 0:
+                time.sleep(5); continue
 
-            compute_heat()
-            reselect_watchlist()
-            try_open_trades()
-            manage_trades()
+            top = top5m_from_histories(MAX_ROOM * 2)
+            now = time.time()
+            scored = []
+            with lock:
+                for b in top:
+                    dq = prices.get(b); if not dq: continue
+                    scored.append((b, pct_change_from_lookback(dq, 300, now)))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            selected = [b for b, _ in scored[:MAX_ROOM]]
+
+            with lock:
+                app.config["WATCHLIST"] = set(selected)
+            if DEBUG_LOG:
+                print(f"[ROOM] selected {len(selected)} symbols")
         except Exception as e:
             if DEBUG_LOG:
-                print("[TRADE][ERR]", type(e).__name__, str(e))
+                print("[ROOM][ERR]", type(e).__name__, str(e))
+                traceback.print_exc()
+        time.sleep(RESELECT_EVERY_SEC)
+
+def analyzer():
+    while True:
+        if time.time() - start_time < GLOBAL_WARMUP_SEC:
+            time.sleep(1); continue
+        try:
+            compute_market_heat()
+            m = adaptive_multipliers()
+
+            # لقطة آمنة للغرفة
+            with lock:
+                room = set(app.config.get("WATCHLIST", set()))
+                snapshots = {b: list(prices[b]) for b in room if prices.get(b)}
+
+            rank_map = global_rank_map()
+
+            # قيّم المتابعات المفتوحة دائمًا
+            evaluate_open_predictions()
+
+            # Edge-trigger (أنماط الثواني) + مشغلات الشموع
+            for base, dq_snap in snapshots.items():
+                prev = pattern_state[base]
+                cur_top1  = check_top1_pattern(dq_snap, m)
+                cur_top10 = False if cur_top1 else check_top10_pattern(dq_snap, m)
+                trig = can_enter_long(base)
+
+                if cur_top1 and not prev["top1"]:
+                    notify_signal(base, "top1", rank_map)
+                elif cur_top10 and not prev["top10"]:
+                    notify_signal(base, "top10", rank_map)
+                elif trig:
+                    tag = "momo" if trig["triggers"]["momo"] else ("bo" if trig["triggers"]["bo"] else "bounce")
+                    notify_signal(base, tag, rank_map)
+
+                pattern_state[base]["top1"]  = cur_top1
+                pattern_state[base]["top10"] = cur_top10
+
+            # تكيّف كل N نتائج مغلقة
+            adapt_thresholds_every_n()
+
+        except Exception as e:
+            if DEBUG_LOG:
+                print("[ANALYZER][ERR]", type(e).__name__, str(e))
                 traceback.print_exc()
         time.sleep(1)
 
-# =========================
-# 🌐 Web + Telegram
-# =========================
-def fmt_settings():
-    return "\n".join([
-        "⚙️ الضبط الحالي:",
-        f"- VOL30_MIN_PCT: {VOL30_MIN_PCT:.2f}%",
-        f"- RESELECT_MINUTES: {RESELECT_MINUTES}m | ROOM_SIZE: {ROOM_SIZE} | TOP_VOL_KEEP: {TOP_VOL_KEEP}",
-        f"- TARGET: +{TARGET_PCT:.2f}% | STOP: -{STOP_PCT:.2f}% | WINDOW: {FOLLOWUP_WINDOW_SEC//60}m",
-        f"- BREAKOUT≥ {MIN_BREAKOUT_PCT:.2f}% | pullback≤ {MAX_PULLBACK_PCT:.2f}%",
-        f"- HEAT: lookback={HEAT_LOOKBACK_SEC}s ret={HEAT_RET_PCT:.2f}% smooth={HEAT_SMOOTH:.2f}",
-        f"- FLOOD: {FLOOD_MAX_PER_WINDOW}/{FLOOD_WINDOW_SEC}s | DEDUP {DEDUP_SEC}s",
-        f"- TAG: {EXPERIMENT_TAG}"
-    ])
+def adapt_thresholds_every_n():
+    global BASE_STEP_PCT, BASE_STRONG_SEQ, last_adapt_total
+    total_closed = len(history_results)
+    if total_closed - last_adapt_total < ADAPT_EVERY_N:
+        return
+    window = list(history_results)[-ADAPT_EVERY_N:]
+    if not window: return
 
-def fmt_summary():
-    total = len(history)
-    if total == 0:
-        return "📊 لا توجد نتائج بعد."
-    wins = [x for x in history if "✅" in x[2]]
-    misses = [x for x in history if "❌" in x[2]]
-    rate = (len(wins)/total)*100.0 if total else 0.0
-    lines = [
-        f"📊 الملخص (آخر {total} دخول متبوع):",
-        f"أصابت: {len(wins)} | خابت: {len(misses)} | نجاح: {rate:.1f}%",
-        "",
-        "✅ الناجحة (آخر 10):"
-    ]
-    for row in wins[-10:]:
-        _, b, status, best, reason, ctx = row
-        lines.append(f"{b}: {status} | أفضل {best:+.2f}% | سبب {reason}")
-    lines += ["", "❌ الخائبة (آخر 10):"]
-    for row in misses[-10:]:
-        _, b, status, best, reason, ctx = row
-        lines.append(f"{b}: {status} | أفضل {best:+.2f}% | سبب {reason}")
-    return "\n".join(lines)
+    hits = sum(1 for *_, status, __, ___, ____ in window if "✅" in status)
+    rate = hits / len(window)
 
+    # عدّل top10
+    if rate <= ADAPT_WIN_LOW:
+        BASE_STEP_PCT = min(round(BASE_STEP_PCT + 0.15, 2), STEP_MAX)
+    elif rate >= ADAPT_WIN_HIGH:
+        BASE_STEP_PCT = max(round(BASE_STEP_PCT - 0.10, 2), STEP_MIN)
+
+    # عدّل أول عنصر من تسلسل top1
+    parts = [float(x) for x in BASE_STRONG_SEQ.split(",")]
+    if parts:
+        if rate <= ADAPT_WIN_LOW:
+            parts[0] = min(parts[0] + 0.20, SEQ0_MAX)
+        elif rate >= ADAPT_WIN_HIGH:
+            parts[0] = max(parts[0] - 0.20, SEQ0_MIN)
+        BASE_STRONG_SEQ = ",".join(f"{x:.2f}".rstrip('0').rstrip('.') for x in parts[:3])
+
+    last_adapt_total = total_closed
+    if DEBUG_LOG:
+        print(f"[ADAPT N] total={total_closed} win_rate_last_{ADAPT_EVERY_N}={rate:.2%} "
+              f"=> BASE_STEP_PCT={BASE_STEP_PCT} BASE_STRONG_SEQ={BASE_STRONG_SEQ}")
+
+# =========================
+# 🌐 Web & Telegram
+# =========================
 @app.get("/")
 def health():
-    return "Try-to-understand (30m candles, 15m reselection, 10m follow-up) ✅", 200
+    return "Signals FINAL (10m peak + percentiles + N-adapt) ✅", 200
 
 @app.get("/stats")
 def stats():
     with lock:
-        wl = list(watchlist)
-        open_n = len(open_trades)
-        with_data = sum(1 for _, v in ticks.items() if v)
-    total = len(history)
-    wins = sum(1 for x in history if "✅" in x[2])
-    rate = (wins/total*100.0) if total else None
+        room = list(app.config.get("WATCHLIST", set()))
+        with_data = sum(1 for _, v in prices.items() if v)
+        open_n = sum(1 for v in open_preds.values() if v.get("status") is None)
+    total = len(history_results)
+    hits = sum(1 for *_, s, __, ___, ____ in history_results if "✅" in s)
+    rate = (hits / total * 100.0) if total else None
     return {
-        "watchlist": wl,
-        "open_trades": open_n,
+        "markets_tracked": len(symbols_all_eur),
         "symbols_with_data": with_data,
-        "heat": round(heat_ewma,3),
-        "last_bulk_age": (time.time()-last_bulk_ts) if last_bulk_ts else None,
-        "win_rate_pct": round(rate,1) if rate is not None else None
+        "room_size": len(room),
+        "open_predictions": open_n,
+        "heat_ewma": round(heat_ewma, 4),
+        "last_bulk_age": (time.time() - last_bulk_ts) if last_bulk_ts else None,
+        "base_step_pct": BASE_STEP_PCT,
+        "base_strong_seq": BASE_STRONG_SEQ,
+        "pctl": {"r1m": round(PCTL_R1M,3), "accel": round(PCTL_ACCEL,3), "rng3": round(PCTL_RNG3,3)},
+        "win_rate_pct": round(rate, 1) if rate is not None else None,
+        "last_adapt_after_total": last_adapt_total
     }, 200
 
+def send_summary():
+    total = len(history_results)
+    if total == 0:
+        send_message("📊 لا توجد نتائج بعد."); return
+    hits = [(ts, b, t, s, ex, act, hc) for (ts, b, t, s, ex, act, hc) in history_results if "✅" in s]
+    misses = [(ts, b, t, s, ex, act, hc) for (ts, b, t, s, ex, act, hc) in history_results if "❌" in s]
+    rate = (len(hits) / total) * 100.0
+
+    def fmt(row):
+        _, b, tag, status, ex, act, hc = row
+        hc_txt = f" | 1h {hc:+.2f}%" if hc is not None else ""
+        return f"{b} [{tag}]: {status} | هدف {ex:+.2f}% | أفضل {act:+.2f}%{hc_txt}"
+
+    show_h = hits[-60:]
+    show_m = misses[-60:]
+
+    lines = [
+        f"📊 الملخص (آخر {total} إشارة متبوعة):",
+        f"أصابت: {len(hits)} | خابت: {len(misses)} | نجاح: {rate:.1f}%",
+        "",
+        f"✅ الناجحة (آخر {len(show_h)}):"
+    ]
+    lines += [fmt(x) for x in show_h]
+    lines += ["", f"❌ الخائبة (آخر {len(show_m)}):"]
+    lines += [fmt(x) for x in show_m]
+    send_message("\n".join(lines))
+
+def get_settings_summary():
+    total = len(history_results)
+    hits = sum(1 for *_, status, __, ___, ____ in history_results if "✅" in status)
+    win_rate = (hits / total * 100.0) if total else 0.0
+    lines = [
+        "⚙️ الضبط الحالي:",
+        f"- BASE_STEP_PCT (top10 1%+1%): {BASE_STEP_PCT:.2f} %",
+        f"- BASE_STRONG_SEQ (top1): {BASE_STRONG_SEQ}",
+        f"- TARGET_PCT (هدف 10د): {TARGET_PCT:.2f} %",
+        f"- FOLLOWUP_WINDOW_SEC: {FOLLOWUP_WINDOW_SEC}s",
+        f"- RANK_FILTER (Top N): {RANK_FILTER}",
+        f"- ALERT_COOLDOWN_SEC: {ALERT_COOLDOWN_SEC}s",
+        f"- FLOOD: {FLOOD_MAX_PER_WINDOW}/{FLOOD_WINDOW_SEC}s | DEDUP: {DEDUP_SEC}s",
+        f"- HEAT: lookback={HEAT_LOOKBACK_SEC}s, ret={HEAT_RET_PCT:.2f}%, smooth={HEAT_SMOOTH:.2f}",
+        f"- PCTL: r1m≈{PCTL_R1M:.2f} | accel≈{PCTL_ACCEL:.2f} | rng3≈{PCTL_RNG3:.2f}",
+        "",
+        "🤖 سياسة التكيّف (كل N):",
+        f"- كل {ADAPT_EVERY_N} إشارة متبوعة نراجع آخر حزمة ونعدّل",
+        f"- حدود: STEP[{STEP_MIN:.2f},{STEP_MAX:.2f}] | SEQ0[{SEQ0_MIN:.2f},{SEQ0_MAX:.2f}]",
+        f"- قرار: ≤{int(ADAPT_WIN_LOW*100)}% يشدّد | ≥{int(ADAPT_WIN_HIGH*100)}% يرخي",
+        "",
+        f"📈 الأداء الإجمالي: نجاح {win_rate:.1f}% ({hits}/{total})",
+        f"🔁 آخر تكيّف بعد: {last_adapt_total} إشارة"
+    ]
+    return "\n".join(lines)
+
 @app.post("/webhook")
-def webhook():
+def telegram_webhook():
     data = request.json or {}
     msg = data.get("message") or {}
     text = (msg.get("text") or "").strip().lower()
-    if not text: return "ok", 200
-
-    if text in {"الملخص","/summary"}:
-        send_message(fmt_summary()); return "ok", 200
-    if text in {"الضبط","/status","status","الحالة","/stats"}:
-        send_message(fmt_settings()); return "ok", 200
+    if not text:
+        return "ok", 200
+    if text in {"الملخص", "/summary"}:
+        send_summary(); return "ok", 200
+    if text in {"الضبط", "/status", "status", "الحالة", "/stats", "شو عم تعمل", "/شو_عم_تعمل"}:
+        send_message(get_settings_summary()); return "ok", 200
     return "ok", 200
 
 # =========================
-# 🏁 التشغيل
+# 🏁 تشغيل الخيوط
 # =========================
 def start_workers_once():
-    if started.is_set(): return
+    if started.is_set():
+        return
     with lock:
-        if started.is_set(): return
-        Thread(target=price_poller, daemon=True).start()
-        Thread(target=selector_and_trader, daemon=True).start()
+        if started.is_set():
+            return
+        Thread(target=price_poller,   daemon=True).start()
+        Thread(target=room_refresher, daemon=True).start()
+        Thread(target=analyzer,       daemon=True).start()
         started.set()
-        if DEBUG_LOG: print("[BOOT] threads started")
+        if DEBUG_LOG:
+            print("[BOOT] threads started")
 
+# شغّل مع Gunicorn
+start_workers_once()
+
+# تشغيل محلي
 if __name__ == "__main__":
     start_workers_once()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
