@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, time, requests, traceback, threading, random
+import os, time, requests, traceback, random
 from collections import deque, defaultdict
 from threading import Thread, Lock, Event
 from flask import Flask, request, jsonify
@@ -14,12 +14,12 @@ app = Flask(__name__)
 BASE_URL             = os.getenv("BITVAVO_URL", "https://api.bitvavo.com/v2")
 HTTP_TIMEOUT         = float(os.getenv("HTTP_TIMEOUT", 8.0))
 
-SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 5))         # فترة سحب الأسعار (ث)
-MARKETS_REFRESH_SEC  = int(os.getenv("MARKETS_REFRESH_SEC", 60))  # تحديث قائمة الأسواق (ث)
+SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 5))          # سحب الأسعار (ث)
+MARKETS_REFRESH_SEC  = int(os.getenv("MARKETS_REFRESH_SEC", 60))   # تحديث قائمة الأسواق
 MAX_ROOM             = int(os.getenv("MAX_ROOM", 20))              # حجم غرفة المراقبة
-BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 180))  # إعادة انتقاء الغرفة (ث)
+BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 180))   # إعادة اختيار الغرفة
 
-RANK_FILTER          = int(os.getenv("RANK_FILTER", 10))           # لا إشعار إلا إذا Top N
+RANK_FILTER          = int(os.getenv("RANK_FILTER", 10))           # لا إشعار إلا إذا ضمن Top N
 
 # أنماط الإشارة
 BASE_STEP_PCT        = float(os.getenv("BASE_STEP_PCT", 1.0))      # نمط top10: 1% + 1%
@@ -28,13 +28,23 @@ SEQ_WINDOW_SEC       = int(os.getenv("SEQ_WINDOW_SEC", 300))       # نافذة 
 STEP_WINDOW_SEC      = int(os.getenv("STEP_WINDOW_SEC", 180))      # نافذة 1% + 1%
 
 # حرارة السوق
-HEAT_LOOKBACK_SEC    = int(os.getenv("HEAT_LOOKBACK_SEC", 120))    # كم ثانية نرجع لقياس الحركة
+HEAT_LOOKBACK_SEC    = int(os.getenv("HEAT_LOOKBACK_SEC", 120))    # نافذة الحرارة
 HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))       # % تعتبر حركة ضمن نافذة الحرارة
 HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))        # EWMA
 
-# منع السبام
-ALERT_COOLDOWN_SEC   = int(os.getenv("BUY_COOLDOWN_SEC", 900))     # كولداون لكل عملة
-GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))     # إحماء
+# متابعة التوقع (هدف/ستوب/مهلة)
+FOLLOWUP_WINDOW_SEC  = int(os.getenv("FOLLOWUP_WINDOW_SEC", 300))  # 5 دقائق
+TARGET_PCT           = float(os.getenv("TARGET_PCT", 2.0))         # هدف +%
+STOP_PCT             = float(os.getenv("STOP_PCT", 1.0))           # ستوب -%
+
+# مضاد السيل/التكرار
+ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", 900))   # كولداون لكل عملة
+FLOOD_WINDOW_SEC     = int(os.getenv("FLOOD_WINDOW_SEC", 30))
+FLOOD_MAX_PER_WINDOW = int(os.getenv("FLOOD_MAX_PER_WINDOW", 8))
+DEDUP_SEC            = int(os.getenv("DEDUP_SEC", 5))
+
+# إحماء
+GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))
 
 # تيليجرام
 BOT_TOKEN            = os.getenv("BOT_TOKEN")
@@ -50,23 +60,35 @@ STATS_EVERY_SEC      = int(os.getenv("STATS_EVERY_SEC", 60))
 lock = Lock()
 started = Event()
 
-symbols_all_eur = []                       # كل الأزواج مقابل EUR
+symbols_all_eur = []                     # كل الأزواج مقابل EUR
 last_markets_refresh = 0
 
-prices = defaultdict(lambda: deque())      # base -> deque[(ts, price)]
-last_alert = {}                             # base -> ts
+prices = defaultdict(lambda: deque())    # base -> deque[(ts, price)]
 heat_ewma = 0.0
 start_time = time.time()
 
-# كاش آخر قراءة bulk
-latest_price_map = {}                      # base -> price
+latest_price_map = {}                    # base -> price (آخر bulk)
 last_bulk_ts = 0
 
+# إشعارات/أنماط
+last_alert_ts = {}                       # base -> ts (كولداون)
+pattern_state = defaultdict(lambda: {"top1": False, "top10": False})
+
+# مضاد السيل/التكرار
+from collections import deque as _deque
+flood_times = _deque()                   # طوابع زمنية لآخر الإشعارات
+last_msg = {"text": None, "ts": 0.0}
+
+# متابعة التوقعات
+open_preds = {}                          # base -> dict(time, price, tag, expected, stop, status=None)
+history_results = deque(maxlen=500)      # [(ts, base, tag, status, expected, actual)]
+learning_window = deque(maxlen=40)       # "hit"/"miss"
+
 # =========================
-# 🛰️ دوال HTTP
+# 🛰️ HTTP
 # =========================
 def http_get(url, params=None, timeout=HTTP_TIMEOUT):
-    headers = {"User-Agent": "signals-only-predictor/1.0"}
+    headers = {"User-Agent": "signals-only-predictor/1.1"}
     for _ in range(2):
         try:
             return requests.get(url, params=params, timeout=timeout, headers=headers)
@@ -75,7 +97,7 @@ def http_get(url, params=None, timeout=HTTP_TIMEOUT):
     return None
 
 # =========================
-# 🗺️ أسواق EUR
+# أسواق EUR + Bulk ticker
 # =========================
 def refresh_markets(now=None):
     global symbols_all_eur, last_markets_refresh
@@ -97,11 +119,7 @@ def refresh_markets(now=None):
     except Exception:
         pass
 
-# =========================
-# 💹 Bulk ticker
-# =========================
 def bulk_prices():
-    """يعيد dict base->price لكل -EUR من الـ API دفعة واحدة."""
     resp = http_get(f"{BASE_URL}/ticker/price")
     out = {}
     if not resp or resp.status_code != 200:
@@ -123,20 +141,16 @@ def bulk_prices():
 # 🔥 حرارة السوق
 # =========================
 def compute_market_heat():
-    """نسبة العملات التي تحركت ≥ HEAT_RET_PCT خلال HEAT_LOOKBACK_SEC، مع EWMA."""
     global heat_ewma
     now = time.time()
     moved = total = 0
     with lock:
         for base, dq in prices.items():
-            if len(dq) < 2:
-                continue
-            # أقرب نقطة للـ lookback
+            if len(dq) < 2: continue
             old = None
             for ts, pr in reversed(dq):
                 if now - ts >= HEAT_LOOKBACK_SEC:
-                    old = pr
-                    break
+                    old = pr; break
             if old and old > 0:
                 cur = dq[-1][1]
                 ret = (cur - old) / old * 100.0
@@ -149,7 +163,6 @@ def compute_market_heat():
     return heat_ewma
 
 def adaptive_multipliers():
-    """سوق بارد -> 0.75x | متوسط -> 0.9-1.0x | حامي -> 1.25x."""
     h = max(0.0, min(1.0, heat_ewma))
     if h < 0.15:   return 0.75
     if h < 0.35:   return 0.9
@@ -157,64 +170,53 @@ def adaptive_multipliers():
     return 1.25
 
 # =========================
-# 🧮 أدوات تغيّر 5m
+# أدوات r5m + ترتيب
 # =========================
 def pct_change_from_lookback(dq, lookback_sec, now):
-    """يرجع التغيّر % من أقرب نقطة >= lookback_sec. 0 إن لم تتوفر."""
-    if not dq:
-        return 0.0
+    if not dq: return 0.0
     cur = dq[-1][1]
     old = None
     for ts, pr in reversed(dq):
         if now - ts >= lookback_sec:
-            old = pr
-            break
+            old = pr; break
     if old and old > 0:
         return (cur - old) / old * 100.0
     return 0.0
 
 def top5m_from_histories(limit):
-    """اختيار أفضل العملات حسب r5m من تاريخ الأسعار المحلي بدون ضرب API إضافي."""
     now = time.time()
     rows = []
     with lock:
         bases = list(symbols_all_eur) if symbols_all_eur else list(prices.keys())
         for base in bases:
             dq = prices.get(base)
-            if not dq:
-                continue
+            if not dq: continue
             r5m = pct_change_from_lookback(dq, 300, now)
             rows.append((base, r5m))
     rows.sort(key=lambda x: x[1], reverse=True)
     return [b for b, _ in rows[:limit]]
 
 def global_rank_map():
-    """رتبة العملة ضمن كل ما لدينا من تواريخ (تقريب لسوق كامل EUR)."""
     now = time.time()
     rows = []
     with lock:
         for base, dq in prices.items():
-            if not dq:
-                continue
+            if not dq: continue
             r5m = pct_change_from_lookback(dq, 300, now)
             rows.append((base, r5m))
     rows.sort(key=lambda x: x[1], reverse=True)
     return {b: i+1 for i, (b, _) in enumerate(rows)}
 
 # =========================
-# 🧩 الأنماط (top10/top1)
+# الأنماط (top10/top1)
 # =========================
 def check_top10_pattern(dq_snapshot, m):
-    """1% + 1% داخل STEP_WINDOW_SEC (rolling)."""
     thresh = BASE_STEP_PCT * m
-    if len(dq_snapshot) < 3:
-        return False
+    if len(dq_snapshot) < 3: return False
     now = dq_snapshot[-1][0]
     window = [(ts, p) for ts, p in dq_snapshot if now - ts <= STEP_WINDOW_SEC]
-    if len(window) < 3:
-        return False
+    if len(window) < 3: return False
 
-    # نسمح بأي نقطة بداية ضمن النافذة
     for i in range(len(window) - 2):
         p0 = window[i][1]
         step1 = False
@@ -230,25 +232,20 @@ def check_top10_pattern(dq_snapshot, m):
                 ch2 = (pr - last_p) / last_p * 100.0
                 if ch2 >= thresh:
                     return True
-                # reset إذا انعكاس بنفس المقدار
                 if (pr - last_p) / last_p * 100.0 <= -thresh:
                     break
     return False
 
 def check_top1_pattern(dq_snapshot, m):
-    """تسلسل نسب مثل '2,1,2' داخل SEQ_WINDOW_SEC مع سماحية تراجع صغيرة نسبية."""
     seq_parts = [float(x.strip()) for x in BASE_STRONG_SEQ.split(",") if x.strip()]
-    if not seq_parts or len(dq_snapshot) < 3:
-        return False
+    if not seq_parts or len(dq_snapshot) < 3: return False
     seq_parts = [x * m for x in seq_parts]
 
     now = dq_snapshot[-1][0]
     window = [(ts, p) for ts, p in dq_snapshot if now - ts <= SEQ_WINDOW_SEC]
-    if len(window) < 3:
-        return False
+    if len(window) < 3: return False
 
     slack = 0.3 * m
-    # جرّب أكثر من نقطة بداية لتفادي تفويت الانطلاقة
     for i in range(len(window) - 2):
         base_p = window[i][1]
         peak_after_step = base_p
@@ -267,12 +264,11 @@ def check_top1_pattern(dq_snapshot, m):
                 if peak_after_step > 0:
                     drop = (pr - peak_after_step) / peak_after_step * 100.0
                     if drop <= -slack:
-                        # إعادة ضبط
                         break
     return False
 
 # =========================
-# 📣 تنبيه تنبؤ
+# تنبيه + متابعة
 # =========================
 def send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
@@ -288,23 +284,92 @@ def send_message(text):
         print("Telegram error:", e)
 
 def notify_signal(base, tag, rank_map):
+    # كولداون لكل عملة
+    now = time.time()
+    if base in last_alert_ts and now - last_alert_ts[base] < ALERT_COOLDOWN_SEC:
+        return
+    # رتبة
     rank = rank_map.get(base, 999)
     if rank > RANK_FILTER:
         return
-    now = time.time()
-    if base in last_alert and now - last_alert[base] < ALERT_COOLDOWN_SEC:
+
+    # Flood control عالمي
+    while flood_times and now - flood_times[0] > FLOOD_WINDOW_SEC:
+        flood_times.popleft()
+    if len(flood_times) >= FLOOD_MAX_PER_WINDOW:
         return
-    last_alert[base] = now
-    send_message(f"🔔 تنبؤ: {base} {tag} #top{rank}")
+
+    # Dedup
+    msg = f"🔔 تنبؤ: {base} {tag} #top{rank}"
+    if last_msg["text"] == msg and (now - last_msg["ts"]) < DEDUP_SEC:
+        return
+
+    # افتح متابعة 5 دقائق (إذا ما في متابعة مفتوحة)
+    with lock:
+        dq = prices.get(base)
+        if not dq: return
+        start_price = dq[-1][1]
+        open_preds[base] = {
+            "time": now,
+            "start_price": start_price,
+            "tag": tag,
+            "expected": TARGET_PCT,
+            "stop": STOP_PCT,
+            "status": None
+        }
+
+    # سجّل وإرسل
+    last_alert_ts[base] = now
+    flood_times.append(now)
+    last_msg["text"], last_msg["ts"] = msg, now
+    send_message(msg)
+
+def evaluate_open_predictions():
+    """يفتح/يغلق المتابعات (Hit/Fail) وفق الهدف/الستوب أو انتهاء النافذة."""
+    now = time.time()
+    to_close = []
+    with lock:
+        for base, pred in list(open_preds.items()):
+            if pred["status"] is not None:
+                continue
+            dq = prices.get(base)
+            if not dq:
+                continue
+            cur = dq[-1][1]
+            change = (cur - pred["start_price"]) / pred["start_price"] * 100.0
+
+            # نجاح مبكر عند الوصول للهدف
+            if change >= pred["expected"]:
+                pred["status"] = "✅ أصابت"
+                history_results.append((now, base, pred["tag"], pred["status"], pred["expected"], change))
+                learning_window.append("hit")
+                to_close.append(base)
+                continue
+
+            # فشل مبكر عند ضرب الستوب
+            if change <= -pred["stop"]:
+                pred["status"] = "❌ خابت"
+                history_results.append((now, base, pred["tag"], pred["status"], pred["expected"], change))
+                learning_window.append("miss")
+                to_close.append(base)
+                continue
+
+            # انتهاء النافذة
+            if now - pred["time"] >= FOLLOWUP_WINDOW_SEC:
+                pred["status"] = "✅ أصابت" if change >= pred["expected"] else "❌ خابت"
+                history_results.append((now, base, pred["tag"], pred["status"], pred["expected"], change))
+                learning_window.append("hit" if "✅" in pred["status"] else "miss")
+                to_close.append(base)
+
+        for b in to_close:
+            open_preds.pop(b, None)
 
 # =========================
 # 🔁 العمال
 # =========================
 def price_poller():
-    """bulk fetch → تحديث جميع الـ EUR (نحتفظ بقصّة 20 دقيقة)."""
     global latest_price_map, last_bulk_ts
-    last_stats = 0
-    misses = 0
+    last_stats, misses = 0, 0
     while True:
         try:
             refresh_markets()
@@ -338,38 +403,29 @@ def price_poller():
         time.sleep(SCAN_INTERVAL)
 
 def room_refresher():
-    """اختيار الغرفة Top-5m من كل السوق اعتمادًا على التاريخ المحلي (بلا طلبات إضافية)."""
-    global watchlist
-    # نجعلها مجموعة مُدارة داخل هذه الدالة
     while True:
         try:
-            # تأكّد أن عندنا بيانات كافية
             with lock:
                 ok_data = sum(1 for _, dq in prices.items() if dq and (dq[-1][0] - dq[0][0]) >= 300)
             if ok_data == 0:
-                time.sleep(5)
-                continue
+                time.sleep(5); continue
 
-            top = top5m_from_histories(MAX_ROOM * 2)  # خذ ضعف العدد ثم قصّ
-            # رتّب ثانيةً حسب r5m واحتفظ بـ MAX_ROOM
+            top = top5m_from_histories(MAX_ROOM * 2)
             now = time.time()
             scored = []
             with lock:
                 for b in top:
                     dq = prices.get(b)
-                    if not dq:
-                        continue
+                    if not dq: continue
                     scored.append((b, pct_change_from_lookback(dq, 300, now)))
             scored.sort(key=lambda x: x[1], reverse=True)
             selected = [b for b, _ in scored[:MAX_ROOM]]
 
             with lock:
-                # خزّن كقائمة مراقبة ضمن dict (نستخلصها في analyzer)
                 app.config["WATCHLIST"] = set(selected)
 
             if DEBUG_LOG:
                 print(f"[ROOM] selected {len(selected)} symbols")
-
         except Exception as e:
             if DEBUG_LOG:
                 print("[ROOM][ERR]", type(e).__name__, str(e))
@@ -377,41 +433,68 @@ def room_refresher():
         time.sleep(BATCH_INTERVAL_SEC)
 
 def analyzer():
-    """يفحص الأنماط ويرسل تنبؤات. يشرح سبب الرفض على DEBUG."""
     while True:
         if time.time() - start_time < GLOBAL_WARMUP_SEC:
-            time.sleep(1)
-            continue
+            time.sleep(1); continue
         try:
             compute_market_heat()
             m = adaptive_multipliers()
+
             # لقطة آمنة
             with lock:
-                watchlist = set(app.config.get("WATCHLIST", set()))
-                snapshots = {b: list(prices[b]) for b in watchlist if prices.get(b)}
-            # خريطة رتبة عالمية
+                room = set(app.config.get("WATCHLIST", set()))
+                snapshots = {b: list(prices[b]) for b in room if prices.get(b)}
+
             rank_map = global_rank_map()
 
-            for base, dq_snap in snapshots.items():
-                # نظم الأسباب
-                reason = None
-                if check_top1_pattern(dq_snap, m):
-                    notify_signal(base, "top1", rank_map)
-                    continue
-                if check_top10_pattern(dq_snap, m):
-                    notify_signal(base, "top10", rank_map)
-                    continue
+            # تقييم المتابعات المفتوحة دائمًا
+            evaluate_open_predictions()
 
-                if DEBUG_LOG:
-                    # تحليل مبسّط للأسباب: احسب r5m و step/seq حدود
-                    now = dq_snap[-1][0]
-                    r5m = pct_change_from_lookback(deque(dq_snap), 300, now)
-                    print(f"[SKIP] {base} r5m={r5m:+.2f}% heat={heat_ewma:.2f} m={m:.2f}")
+            # Edge-trigger + تنبيهات
+            for base, dq_snap in snapshots.items():
+                prev = pattern_state[base]
+                cur_top1  = check_top1_pattern(dq_snap, m)
+                cur_top10 = False if cur_top1 else check_top10_pattern(dq_snap, m)
+
+                if cur_top1 and not prev["top1"]:
+                    notify_signal(base, "top1", rank_map)
+                elif cur_top10 and not prev["top10"]:
+                    notify_signal(base, "top10", rank_map)
+
+                pattern_state[base]["top1"]  = cur_top1
+                pattern_state[base]["top10"] = cur_top10
+
+            # تكيّف بسيط حسب الأداء
+            adapt_thresholds()
+
         except Exception as e:
             if DEBUG_LOG:
                 print("[ANALYZER][ERR]", type(e).__name__, str(e))
                 traceback.print_exc()
         time.sleep(1)
+
+def adapt_thresholds():
+    """يشد/يرخي الأنماط حسب نسبة النجاح مؤخراً."""
+    total = len(learning_window)
+    if total < 10:
+        return
+    hits = sum(1 for x in learning_window if x == "hit")
+    rate = hits / total
+
+    global BASE_STEP_PCT, BASE_STRONG_SEQ
+    # شدّد/رخّي خطوة top10
+    if rate < 0.40:
+        BASE_STEP_PCT = min(round(BASE_STEP_PCT + 0.1, 2), 1.8)
+    elif rate > 0.70:
+        BASE_STEP_PCT = max(round(BASE_STEP_PCT - 0.1, 2), 0.6)
+
+    # عدّل تسلسل top1 بخفة (أول رقم فقط)
+    parts = [float(x) for x in BASE_STRONG_SEQ.split(",")]
+    if rate < 0.40:
+        parts[0] = min(parts[0] + 0.2, 3.0)
+    elif rate > 0.70:
+        parts[0] = max(parts[0] - 0.2, 1.2)
+    BASE_STRONG_SEQ = ",".join(f"{x:.2f}".rstrip('0').rstrip('.') for x in parts[:3])
 
 # =========================
 # 🏁 تشغيل الخيوط
@@ -429,33 +512,34 @@ def start_workers_once():
         if DEBUG_LOG:
             print("[BOOT] threads started")
 
-# شغّل عند الاستيراد (مناسب لـ Gunicorn)
 start_workers_once()
 
 # =========================
-# 🌐 Web
+# 🌐 Web & Telegram
 # =========================
 @app.get("/")
 def health():
-    return "Signals-only predictor is alive ✅", 200
+    return "Signals-only predictor (edge + follow-up) ✅", 200
 
 @app.get("/stats")
 def stats():
     with lock:
         room = list(app.config.get("WATCHLIST", set()))
         with_data = sum(1 for _, v in prices.items() if v)
+        open_n = sum(1 for v in open_preds.values() if v.get("status") is None)
     return {
         "markets_tracked": len(symbols_all_eur),
         "symbols_with_data": with_data,
         "room_size": len(room),
-        "room": room,
+        "open_predictions": open_n,
         "heat_ewma": round(heat_ewma, 4),
-        "last_bulk_age": (time.time() - last_bulk_ts) if last_bulk_ts else None
+        "last_bulk_age": (time.time() - last_bulk_ts) if last_bulk_ts else None,
+        "base_step_pct": BASE_STEP_PCT,
+        "base_strong_seq": BASE_STRONG_SEQ
     }, 200
 
 @app.get("/peek")
 def peek():
-    """عينة صغيرة تُظهر قيم r5m وأسباب الرفض بشكل مبسّط."""
     now = time.time()
     sample = []
     with lock:
@@ -464,21 +548,37 @@ def peek():
         snaps = {b: list(prices[b]) for b in picks if prices.get(b)}
     for b, dq in snaps.items():
         r5m = pct_change_from_lookback(deque(dq), 300, now)
-        passed_top1 = check_top1_pattern(dq, adaptive_multipliers())
-        passed_top10 = check_top10_pattern(dq, adaptive_multipliers())
-        reason = "PASS_TOP1" if passed_top1 else ("PASS_TOP10" if passed_top10 else "no-pattern")
+        m = adaptive_multipliers()
+        p1 = check_top1_pattern(dq, m)
+        p10 = (not p1) and check_top10_pattern(dq, m)
         sample.append({
-            "symbol": b,
-            "r5m": round(r5m, 3),
-            "len": len(dq),
-            "last_age_sec": int(now - dq[-1][0]),
-            "reason": reason
+            "symbol": b, "r5m": round(r5m, 3),
+            "len": len(dq), "last_age_sec": int(now - dq[-1][0]),
+            "top1": bool(p1), "top10": bool(p10)
         })
     return jsonify({
         "room_size": len(room),
         "heat": round(heat_ewma, 3),
         "sample": sample
     }), 200
+
+def send_summary():
+    """يرسل ملخصًا عبر تيليجرام: إجمالي/نجاحات/إخفاقات + آخر 12 نتيجة."""
+    total = len(history_results)
+    if total == 0:
+        send_message("📊 لا توجد نتائج بعد."); return
+    hits = sum(1 for *_, status, __, ___ in history_results if "✅" in status)
+    misses = total - hits
+    rate = (hits / total) * 100.0
+    lines = [
+        f"📊 الملخص (آخر {total} إشارة متبوعة):",
+        f"أصابت: {hits} | خابت: {misses} | نجاح: {rate:.1f}%",
+        "",
+        "آخر 12 نتيجة:"
+    ]
+    for ts, base, tag, status, exp, act in list(history_results)[-12:]:
+        lines.append(f"{base} [{tag}]: {status} | هدف {exp:+.2f}% | فعلي {act:+.2f}%")
+    send_message("\n".join(lines))
 
 @app.post("/webhook")
 def telegram_webhook():
@@ -487,13 +587,13 @@ def telegram_webhook():
     text = (msg.get("text") or "").strip().lower()
     if not text:
         return "ok", 200
-
-    STATUS_ALIASES = {"الحالة", "/status", "/stats", "شو عم تعمل", "/شو_عم_تعمل", "status"}
-    if text in STATUS_ALIASES:
-        # نص موجز للحالة
+    if text in {"الملخص", "/summary"}:
+        send_summary(); return "ok", 200
+    if text in {"الحالة", "/status", "/stats", "شو عم تعمل", "/شو_عم_تعمل", "status"}:
         with lock:
             room = list(app.config.get("WATCHLIST", set()))
-        send_message(f"📊 room {len(room)}/{MAX_ROOM} | heat {heat_ewma:.2f}")
+            open_n = sum(1 for v in open_preds.values() if v.get("status") is None)
+        send_message(f"📊 room {len(room)}/{MAX_ROOM} | open {open_n} | heat {heat_ewma:.2f}")
         return "ok", 200
     return "ok", 200
 
