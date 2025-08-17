@@ -95,39 +95,39 @@ def redis_store_price(base, ts, price):
     pipe.expire(key, REDIS_TTL_SEC)  # تنظيف تلقائي
     pipe.execute()
 
-def redis_change_window(base, minutes=60):
-    """تغير % بين أول سعر منذ now-minutes*60 وآخر سعر مسجّل. يرجّع None إن ما في نقطتين."""
+def redis_change_window(base, minutes=60, require_points=2):
+    """
+    التغيّر % بين أول وآخر سعر داخل نافذة آخر `minutes` دقيقة تحديداً.
+    يرجّع None إذا نقاط النافذة أقل من `require_points`.
+    """
     key = r_key(base)
-    if r.zcard(key) < 2:
-        return None
     now_ts = int(time.time())
-    from_ts = now_ts - minutes*60
+    from_ts = now_ts - minutes * 60
 
-    # أول عنصر >= from_ts
+    # نقاط النافذة: أول وأخر داخل [from_ts, now_ts]
     first = r.zrangebyscore(key, from_ts, now_ts, start=0, num=1)
-    if not first:  # إذا ما في نقطة ضمن النافذة، خذ أقدم نقطة موجودة
-        first = r.zrange(key, 0, 0)
-    last  = r.zrevrange(key, 0, 0)
-    if not first or not last:
+    last  = r.zrevrangebyscore(key, now_ts, from_ts, start=0, num=1)
+
+    # تحقّق من الكفاية داخل النافذة (على الأقل نقطتان)
+    cnt_window = r.zcount(key, from_ts, now_ts)
+    if cnt_window < require_points or not first or not last:
         return None
+
     try:
         p0 = float(first[0].split(":")[1])
         p1 = float(last[0].split(":")[1])
-        if p0 <= 0: 
+        if p0 <= 0:
             return None
         return (p1 - p0) / p0 * 100.0
     except Exception:
         return None
 
-def trend_top_n(n=3, minutes=60, min_points=2):
-    """أعلى n عملات صعودًا خلال آخر minutes دقيقة."""
+def trend_top_n(n=3, minutes=60):
+    """أعلى n عملات صعوداً خلال آخر minutes دقيقة (من نفس النافذة فقط)."""
     out = []
     bases = list(symbols_all) or [k.split(":")[-1] for k in r.scan_iter(f"pt:{QUOTE}:p:*")]
     for b in bases:
-        key = r_key(b)
-        if r.zcard(key) < min_points:
-            continue
-        ch = redis_change_window(b, minutes=minutes)
+        ch = redis_change_window(b, minutes=minutes, require_points=2)
         if ch is not None:
             out.append((b, ch))
     out.sort(key=lambda x: x[1], reverse=True)
@@ -384,6 +384,24 @@ def telegram_webhook():
             f"- SAQAR: {'ON' if SAQAR_ENABLED and SAQAR_WEBHOOK else 'OFF'}"
         ]
         send_message("\n".join(lines))
+        return "ok", 200
+
+        # ===== فحص سريع للريدز =====
+    if text in {"فحص", "/diag"}:
+        try:
+            keys = list(r.scan_iter(f"pt:{QUOTE}:p:*"))
+            kcnt = len(keys)
+            sample = keys[0] if kcnt else None
+            info_lines = [f"🧰 Redis: {kcnt} مفاتيح"]
+            if sample:
+                cnt_all = r.zcard(sample)
+                now_ts = int(time.time())
+                cnt_5m  = r.zcount(sample, now_ts-300, now_ts)
+                cnt_60m = r.zcount(sample, now_ts-3600, now_ts)
+                info_lines.append(f"- عيّنة: {sample.split(':')[-1]} | all={cnt_all}, 5m={cnt_5m}, 60m={cnt_60m}")
+            send_message("\n".join(info_lines))
+        except Exception as e:
+            send_message(f"Redis ERR: {type(e).__name__}: {e}")
         return "ok", 200
 
     return "ok", 200
