@@ -50,6 +50,10 @@ DEBUG_LOG        = os.getenv("DEBUG_LOG","0") == "1"
 STATS_EVERY_SEC  = int(os.getenv("STATS_EVERY_SEC", 60))
 EXPECTED_MIN     = int(os.getenv("EXPECTED_MIN", 80))  # حد أدنى متوقَّع لعدد الأزواج
 
+# صحة الـAPI
+UNHEALTHY_THRESHOLD = int(os.getenv("UNHEALTHY_THRESHOLD", 6))  # كم فشل متتالٍ قبل اعتبارها DOWN
+consecutive_http_fail = 0
+
 # ========= حالة =========
 lock = Lock()
 started = Event()
@@ -71,16 +75,24 @@ misses = 0
 
 # ========= Helpers =========
 def http_get(url, params=None, timeout=HTTP_TIMEOUT):
+    """
+    طلب GET مع backoff ذكي وطباعة أخطاء واضحة.
+    يعيد Response أو None عند الفشل المتكرر.
+    """
     headers = {"User-Agent":"pump-tick/1.2"}
-    for attempt in range(2):
+    delays = [0.2, 0.5, 1.0, 2.0]  # exponential backoff
+    for i, d in enumerate(delays, 1):
         try:
             resp = requests.get(url, params=params, timeout=timeout, headers=headers)
+            if resp.status_code in (429,) or resp.status_code >= 500:
+                print(f"[HTTP][WARN] {url} -> {resp.status_code} (server busy) retry {i}/{len(delays)}")
+                time.sleep(d); continue
             if resp.status_code != 200:
                 print(f"[HTTP][WARN] {url} -> {resp.status_code} ({resp.text[:120]})")
             return resp
         except Exception as e:
-            print(f"[HTTP][ERR] try={attempt+1} url={url} :: {type(e).__name__}: {e}")
-            time.sleep(0.25)
+            print(f"[HTTP][ERR] {url}: {type(e).__name__}: {e} (retry {i}/{len(delays)})")
+            time.sleep(d)
     return None
 
 def pct(now_p, old_p):
@@ -119,10 +131,8 @@ def redis_change_window(base, minutes=60, require_points=2):
         return None
 
     try:
-        p0 = float(first[0].split(":")[1])
-        p1 = float(last[0].split(":")[1])
-        if p0 <= 0:
-            return None
+        p0 = float(first[0].split(":")[1]); p1 = float(last[0].split(":")[1])
+        if p0 <= 0: return None
         return (p1 - p0) / p0 * 100.0
     except Exception:
         return None
@@ -146,8 +156,7 @@ def refresh_markets(now=None):
         return
     resp = http_get(f"{BASE_URL}/markets")
     if not resp:
-        print("[MARKETS][ERR] No response")
-        return
+        print("[MARKETS][ERR] No response"); return
     if resp.status_code != 200:
         return
     try:
@@ -170,13 +179,11 @@ def bulk_prices():
     resp = http_get(f"{BASE_URL}/ticker/price")
     out = {}
     if not resp:
-        print("[BULK][ERR] No response")
-        return out
+        print("[BULK][ERR] No response"); return out
     if resp.status_code != 200:
         return out
     try:
-        rows = resp.json()
-        for row in rows:
+        for row in resp.json():
             mk = row.get("market","")
             if mk.endswith(f"-{QUOTE}"):
                 base = mk.split("-")[0]
@@ -184,7 +191,6 @@ def bulk_prices():
                     out[base] = float(row["price"])
                 except Exception:
                     print(f"[BULK][WARN] bad price for {mk}: {row.get('price')}")
-                    continue
     except Exception as e:
         print(f"[BULK][ERR] {type(e).__name__}: {e}")
     return out
@@ -192,21 +198,17 @@ def bulk_prices():
 # --- Pump detection ---
 def detect_pump_for(dq, now_ts):
     """يرجع نسبة القفزة خلال WINDOW_SEC استنادًا إلى deque المحلية."""
-    if not dq:
-        return None
+    if not dq: return None
     ref = None
     for ts, pr in reversed(dq):
         if now_ts - ts >= WINDOW_SEC:
-            ref = pr
-            break
-    if ref is None:
-        ref = dq[0][1]
+            ref = pr; break
+    if ref is None: ref = dq[0][1]
     return pct(dq[-1][1], ref) if ref else None
 
 def send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
-        print(f"[TG_DISABLED] {text}")
-        return
+        print(f"[TG_DISABLED] {text}"); return
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -217,31 +219,28 @@ def send_message(text):
         print(f"[TG][ERR] {type(e).__name__}: {e}")
 
 def notify_saqr_buy(base):
-    if not SAQAR_WEBHOOK or not SAQAR_ENABLED:
-        return
+    if not SAQAR_WEBHOOK or not SAQAR_ENABLED: return
     try:
         requests.post(SAQAR_WEBHOOK, json={"message":{"text": f"اشتري {base}"}}, timeout=HTTP_TIMEOUT)
     except Exception as e:
         print(f"[SAQAR][ERR] {type(e).__name__}: {e}")
 
 def maybe_alert(base, jump_pct, price_now):
+    # لا تنبّه أثناء تعطل الـAPI
+    if consecutive_http_fail >= UNHEALTHY_THRESHOLD:
+        return
     now = time.time()
-    if base in last_alert_ts and now - last_alert_ts[base] < COOLDOWN_SEC:
-        return
-    while flood_times and now - flood_times[0] > FLOOD_WINDOW_SEC:
-        flood_times.popleft()
-    if len(flood_times) >= FLOOD_MAX_PER_WINDOW:
-        return
+    if base in last_alert_ts and now - last_alert_ts[base] < COOLDOWN_SEC: return
+    while flood_times and now - flood_times[0] > FLOOD_WINDOW_SEC: flood_times.popleft()
+    if len(flood_times) >= FLOOD_MAX_PER_WINDOW: return
     msg = f"⚡️ Pump? {base} +{jump_pct:.2f}% خلال {WINDOW_SEC}s @ {price_now:.8f} {QUOTE}"
-    if last_msg["text"] == msg and (now - last_msg["ts"]) < DEDUP_SEC:
-        return
+    if last_msg["text"] == msg and (now - last_msg["ts"]) < DEDUP_SEC: return
 
     last_alert_ts[base] = now
     flood_times.append(now)
     last_msg["text"], last_msg["ts"] = msg, now
     detections.append((now, base, jump_pct))
-    send_message(msg)
-    notify_saqr_buy(base)
+    send_message(msg); notify_saqr_buy(base)
 
 # ========= مسح مفاتيح Redis =========
 def clear_redis_prefixes():
@@ -250,30 +249,21 @@ def clear_redis_prefixes():
     البادئات: pt:{QUOTE}:p:*, prices:*, alerted:*, rank_prev_ts:*
     """
     try:
-        patterns = [
-            f"pt:{QUOTE}:p:*",
-            "prices:*",
-            "alerted:*",
-            "rank_prev_ts:*",
-        ]
+        patterns = [f"pt:{QUOTE}:p:*", "prices:*", "alerted:*", "rank_prev_ts:*"]
         total_deleted = 0
         for pat in patterns:
             batch = []
             for k in r.scan_iter(pat, count=1000):
                 batch.append(k)
                 if len(batch) >= 500:
-                    try:
-                        r.unlink(*batch)
-                    except Exception:
-                        r.delete(*batch)
+                    try: r.unlink(*batch)
+                    except Exception: r.delete(*batch)
                     total_deleted += len(batch)
                     print(f"[INIT] Deleted {len(batch)} keys (pattern={pat})")
                     batch.clear()
             if batch:
-                try:
-                    r.unlink(*batch)
-                except Exception:
-                    r.delete(*batch)
+                try: r.unlink(*batch)
+                except Exception: r.delete(*batch)
                 total_deleted += len(batch)
                 print(f"[INIT] Deleted {len(batch)} keys (pattern={pat})")
         print(f"[INIT] Total deleted keys = {total_deleted}")
@@ -287,58 +277,70 @@ def poller():
     - يخزنها في Redis (ساعة)
     - يكشف القفزات
     - يطبع أي مشكلة بوضوح
+    - يهدأ تلقائيًا لو الـAPI معطّلة
     """
-    global last_bulk_ts, misses
+    global last_bulk_ts, misses, consecutive_http_fail
     last_stats = 0
 
     while True:
-        fetched = 0
         try:
             refresh_markets()
             mp  = bulk_prices()   # dict: base -> price
             now = time.time()
 
-            fetched = len(mp)
-            if fetched == 0:
+            if not mp:
                 misses += 1
-                print(f"[POLL][WARN] bulk_prices returned 0 symbols (misses={misses})")
-            else:
-                watchable = fetched if not symbols_all else sum(1 for b in mp if b in symbols_all)
-                print(f"[POLL] fetched={fetched} symbols | watchable={watchable}")
+                consecutive_http_fail += 1
+                print(f"[POLL][WARN] bulk_prices returned 0 symbols (misses={misses}, fails={consecutive_http_fail})")
+                # هدنة عند التعطل
+                if consecutive_http_fail >= UNHEALTHY_THRESHOLD:
+                    sleep_s = min(60, POLL_SEC * 5)
+                    print(f"[HEALTH][DOWN] API unhealthy, sleeping {sleep_s}s")
+                    time.sleep(sleep_s)
+                time.sleep(POLL_SEC); continue
 
-                last_bulk_ts = now
-                redis_errors = 0
+            # API تعافت
+            if consecutive_http_fail >= UNHEALTHY_THRESHOLD:
+                print("[HEALTH][UP] API back healthy ✔")
+            consecutive_http_fail = 0
 
-                with lock:
-                    maxlen = max(20, int(WINDOW_SEC / max(POLL_SEC, 1)) + 6)
-                    for base, price in mp.items():
-                        if symbols_all and base not in symbols_all:
-                            continue
-                        dq = prices[base]
-                        if dq.maxlen != maxlen:
-                            prices[base] = dq = deque(dq, maxlen=maxlen)
-                        dq.append((now, price))
-                        try:
-                            redis_store_price(base, now, price)
-                        except Exception as e:
-                            redis_errors += 1
-                            print(f"[REDIS][ERR] {base}: {type(e).__name__}: {e}")
-                        jump = detect_pump_for(dq, now)
-                        if jump is not None and jump >= PUMP_PCT:
-                            maybe_alert(base, jump, price)
+            fetched = len(mp)
+            watchable = fetched if not symbols_all else sum(1 for b in mp if b in symbols_all)
+            print(f"[POLL] fetched={fetched} symbols | watchable={watchable}")
 
-                if fetched < EXPECTED_MIN:
-                    print(f"[POLL][WARN] only {fetched} symbols (<{EXPECTED_MIN})")
-                if redis_errors:
-                    print(f"[REDIS] completed with {redis_errors} error(s)")
+            last_bulk_ts = now
+            redis_errors = 0
+
+            with lock:
+                maxlen = max(20, int(WINDOW_SEC / max(POLL_SEC, 1)) + 6)
+                for base, price in mp.items():
+                    if symbols_all and base not in symbols_all: continue
+                    dq = prices[base]
+                    if dq.maxlen != maxlen:
+                        prices[base] = dq = deque(dq, maxlen=maxlen)
+                    dq.append((now, price))
+                    try:
+                        redis_store_price(base, now, price)
+                    except Exception as e:
+                        redis_errors += 1
+                        print(f"[REDIS][ERR] {base}: {type(e).__name__}: {e}")
+                    jump = detect_pump_for(dq, now)
+                    if jump is not None and jump >= PUMP_PCT:
+                        maybe_alert(base, jump, price)
+
+            if fetched < EXPECTED_MIN:
+                print(f"[POLL][WARN] only {fetched} symbols (<{EXPECTED_MIN})")
+            if redis_errors:
+                print(f"[REDIS] completed with {redis_errors} error(s)")
 
             if (time.time() - last_stats) >= STATS_EVERY_SEC:
                 last_stats = time.time()
                 with lock:
                     with_data = sum(1 for _, v in prices.items() if v)
                 age = int(now - last_bulk_ts) if last_bulk_ts else None
+                health = 'DOWN' if consecutive_http_fail>=UNHEALTHY_THRESHOLD else 'OK'
                 print(f"[STATS] with_data={with_data} markets_listed={len(symbols_all)} "
-                      f"misses={misses} last_age={age}s window={WINDOW_SEC}s thr={PUMP_PCT}%")
+                      f"misses={misses} last_age={age}s window={WINDOW_SEC}s thr={PUMP_PCT}% health={health}")
                 misses = 0
 
         except Exception as e:
@@ -349,11 +351,9 @@ def poller():
 
 def start_workers_once():
     global _cleared_once
-    if started.is_set(): 
-        return
+    if started.is_set(): return
     with lock:
-        if started.is_set():
-            return
+        if started.is_set(): return
 
         if CLEAR_ON_START and not _cleared_once:
             print("[INIT] Clearing Redis prefixes on start...")
@@ -401,40 +401,26 @@ def trend_api():
 
 @app.post("/webhook")
 def telegram_webhook():
-    data = request.json or {}
-    msg  = data.get("message") or {}
+    data = request.json or {}; msg = data.get("message") or {}
     text = (msg.get("text") or "").strip().lower()
-    if not text:
-        return "ok", 200
+    if not text: return "ok", 200
 
-    # ===== الملخص =====
     if text in {"الملخص", "/summary"}:
-        with lock:
-            recent = list(detections)[-12:]
-        if not recent:
-            send_message("📊 لا توجد إشعارات بعد.")
+        with lock: recent = list(detections)[-12:]
+        if not recent: send_message("📊 لا توجد إشعارات بعد.")
         else:
-            lines = ["📊 آخر الإشعارات:"]
-            for ts, b, p in recent:
-                lines.append(f"- {b}: +{p:.2f}% خلال {WINDOW_SEC}s")
+            lines = ["📊 آخر الإشعارات:"] + [f"- {b}: +{p:.2f}% خلال {WINDOW_SEC}s" for _, b, p in recent]
             send_message("\n".join(lines))
         return "ok", 200
 
-    # ===== الترند (يدعم: 'الترند', 'الترند 15', 'الترند 15 5', '/trend ...') =====
     if text.startswith("الترند") or text.startswith("/trend"):
         parts = text.replace("/trend", "الترند").split()
-        mins = 60
-        topn = 3
-        if len(parts) >= 2 and parts[1].isdigit():
-            mins = int(parts[1])
-        if len(parts) >= 3 and parts[2].isdigit():
-            topn = int(parts[2])
-        mins = max(5, min(mins, 360))
-        topn = max(1, min(topn, 10))
-
+        mins = 60; topn = 3
+        if len(parts) >= 2 and parts[1].isdigit(): mins = int(parts[1])
+        if len(parts) >= 3 and parts[2].isdigit(): topn = int(parts[2])
+        mins = max(5, min(mins, 360)); topn = max(1, min(topn, 10))
         top = trend_top_n(n=topn, minutes=mins)
-        if not top:
-            send_message(f"📈 لا توجد بيانات كافية لآخر {mins} دقيقة بعد.")
+        if not top: send_message(f"📈 لا توجد بيانات كافية لآخر {mins} دقيقة بعد.")
         else:
             lines = [f"📈 أقوى {len(top)} خلال آخر {mins} دقيقة:"]
             for b, c in top:
@@ -443,7 +429,6 @@ def telegram_webhook():
             send_message("\n".join(lines))
         return "ok", 200
 
-    # ===== الضبط / الحالة =====
     if text in {"الضبط", "/status", "status"}:
         lines = [
             "⚙️ Pump-Tick settings:",
@@ -451,18 +436,17 @@ def telegram_webhook():
             f"- COOLDOWN = {COOLDOWN_SEC}s | FLOOD = {FLOOD_MAX_PER_WINDOW}/{FLOOD_WINDOW_SEC}s | DEDUP = {DEDUP_SEC}s",
             f"- QUOTE = {QUOTE} | MARKETS_REFRESH_SEC = {MARKETS_REFRESH_SEC}s",
             f"- Redis TTL = {REDIS_TTL_SEC}s | Redis prefix = pt:{QUOTE}:p:*",
+            f"- Health threshold = {UNHEALTHY_THRESHOLD} fails",
             f"- SAQAR: {'ON' if SAQAR_ENABLED and SAQAR_WEBHOOK else 'OFF'}"
         ]
         send_message("\n".join(lines))
         return "ok", 200
 
-    # ===== مسح يدوي للريدز =====
     if text in {"مسح", "/clear"}:
         clear_redis_prefixes()
         send_message("🧹 تم مسح مفاتيح Redis الخاصة بالبوت.")
         return "ok", 200
 
-    # ===== فحص سريع للريدز =====
     if text in {"فحص", "/diag"}:
         try:
             keys = list(r.scan_iter(f"pt:{QUOTE}:p:*"))
@@ -485,6 +469,5 @@ def telegram_webhook():
 # ========= Run =========
 start_workers_once()
 if __name__ == "__main__":
-    # عند التشغيل المحلي أيضًا
     start_workers_once()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
