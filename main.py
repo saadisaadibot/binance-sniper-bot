@@ -95,29 +95,39 @@ def redis_store_price(base, ts, price):
     pipe.expire(key, REDIS_TTL_SEC)  # تنظيف تلقائي
     pipe.execute()
 
-def redis_hour_change(base):
-    """يعيد التغير % بين أول وآخر نقطة خلال 60 دقيقة، أو None إن لم تتوفر بيانات كافية."""
+def redis_change_window(base, minutes=60):
+    """تغير % بين أول سعر منذ now-minutes*60 وآخر سعر مسجّل. يرجّع None إن ما في نقطتين."""
     key = r_key(base)
     if r.zcard(key) < 2:
         return None
-    first = r.zrange(key, 0, 0)         # أقدم عنصر
-    last  = r.zrevrange(key, 0, 0)      # أحدث عنصر
+    now_ts = int(time.time())
+    from_ts = now_ts - minutes*60
+
+    # أول عنصر >= from_ts
+    first = r.zrangebyscore(key, from_ts, now_ts, start=0, num=1)
+    if not first:  # إذا ما في نقطة ضمن النافذة، خذ أقدم نقطة موجودة
+        first = r.zrange(key, 0, 0)
+    last  = r.zrevrange(key, 0, 0)
     if not first or not last:
         return None
     try:
         p0 = float(first[0].split(":")[1])
         p1 = float(last[0].split(":")[1])
-        return pct(p1, p0)
+        if p0 <= 0: 
+            return None
+        return (p1 - p0) / p0 * 100.0
     except Exception:
         return None
 
-def trend_top_n(n=3):
-    """أعلى n عملات صعودًا خلال الساعة الأخيرة (اعتمادًا على Redis)."""
+def trend_top_n(n=3, minutes=60, min_points=2):
+    """أعلى n عملات صعودًا خلال آخر minutes دقيقة."""
     out = []
-    # استعمل قائمة الأسواق إن كانت جاهزة، وإلا امسح المفاتيح
     bases = list(symbols_all) or [k.split(":")[-1] for k in r.scan_iter(f"pt:{QUOTE}:p:*")]
     for b in bases:
-        ch = redis_hour_change(b)
+        key = r_key(b)
+        if r.zcard(key) < min_points:
+            continue
+        ch = redis_change_window(b, minutes=minutes)
         if ch is not None:
             out.append((b, ch))
     out.sort(key=lambda x: x[1], reverse=True)
@@ -303,9 +313,16 @@ def stats():
 
 @app.get("/trend")
 def trend_api():
-    top = trend_top_n(3)
-    return jsonify({"top3_last_hour": [{"base":b,"chg_pct":round(c,2)} for b,c in top]}), 200
-
+    try:
+        mins = int(request.args.get("mins", "60"))
+        n    = int(request.args.get("n", "3"))
+    except Exception:
+        mins, n = 60, 3
+    top = trend_top_n(n=n, minutes=mins)
+    return jsonify({
+        "minutes": mins,
+        "top": [{"base": b, "chg_pct": round(c, 3 if abs(c) < 1 else 2)} for b, c in top]
+    }), 200
 @app.post("/webhook")
 def telegram_webhook():
     data = request.json or {}
