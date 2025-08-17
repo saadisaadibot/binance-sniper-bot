@@ -330,6 +330,8 @@ def telegram_webhook():
     text = (msg.get("text") or "").strip().lower()
     if not text:
         return "ok", 200
+
+    # ===== الملخص =====
     if text in {"الملخص", "/summary"}:
         with lock:
             recent = list(detections)[-12:]
@@ -341,16 +343,37 @@ def telegram_webhook():
                 lines.append(f"- {b}: +{p:.2f}% خلال {WINDOW_SEC}s")
             send_message("\n".join(lines))
         return "ok", 200
-    if text in {"الترند", "/trend"}:
-        top = trend_top_n(3)
+
+    # ===== الترند (يدعم: 'الترند', 'الترند 15', 'الترند 15 5', '/trend ...') =====
+    if text.startswith("الترند") or text.startswith("/trend"):
+        # أمثلة نصية:
+        # "الترند"        → mins=60, n=3
+        # "الترند 15"     → mins=15, n=3
+        # "الترند 15 5"   → mins=15, n=5
+        parts = text.replace("/trend", "الترند").split()
+        mins = 60
+        topn = 3
+        # قراءة الأرقام إن وُجدت
+        if len(parts) >= 2 and parts[1].isdigit():
+            mins = int(parts[1])
+        if len(parts) >= 3 and parts[2].isdigit():
+            topn = int(parts[2])
+        # حدود أمان بسيطة
+        mins = max(5, min(mins, 360))     # من 5 دقائق حتى 6 ساعات
+        topn = max(1, min(topn, 10))      # من 1 إلى 10 عملات
+
+        top = trend_top_n(n=topn, minutes=mins)
         if not top:
-            send_message("📈 لا توجد بيانات كافية للساعة الماضية بعد.")
+            send_message(f"📈 لا توجد بيانات كافية لآخر {mins} دقيقة بعد.")
         else:
-            lines = ["📈 أقوى 3 خلال آخر ساعة:"]
+            lines = [f"📈 أقوى {len(top)} خلال آخر {mins} دقيقة:"]
             for b, c in top:
-                lines.append(f"- {b} : {c:+.2f}%")
+                fmt = f"{c:+.3f}%" if abs(c) < 1 else f"{c:+.2f}%"
+                lines.append(f"- {b} : {fmt}")
             send_message("\n".join(lines))
         return "ok", 200
+
+    # ===== الضبط / الحالة =====
     if text in {"الضبط", "/status", "status"}:
         lines = [
             "⚙️ Pump-Tick settings:",
@@ -362,6 +385,7 @@ def telegram_webhook():
         ]
         send_message("\n".join(lines))
         return "ok", 200
+
     return "ok", 200
 
 # ========= Run =========
