@@ -10,6 +10,9 @@ load_dotenv()
 app = Flask(__name__)
 
 # ========= إعدادات عامة =========
+CLEAR_ON_START = os.getenv("CLEAR_ON_START", "1") == "1"
+_cleared_once = False
+
 BASE_URL   = os.getenv("BITVAVO_URL", "https://api.bitvavo.com/v2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", 6.0))
 
@@ -441,21 +444,59 @@ def telegram_webhook():
 
 # ========= Run =========
 
-def clear_old_keys():
+def clear_redis_prefixes():
     """
-    يمسح المفاتيح القديمة الخاصة بالبوت (pt:{QUOTE}:p:*) 
-    لتجنب بيانات عالقة من دورات سابقة.
+    يمسح المفاتيح الخاصة بالبوت (جديدة وقديمة) على دفعات كي لا يحظر Redis.
+    البادئات: pt:{QUOTE}:p:*, prices:*, alerted:*, rank_prev_ts:*
     """
     try:
-        pattern = f"pt:{QUOTE}:p:*"
-        keys = list(r.scan_iter(pattern))
-        if keys:
-            r.delete(*keys)
-            print(f"[INIT] Cleared {len(keys)} old Redis keys (pattern={pattern}).")
-        else:
-            print(f"[INIT] No old keys found for pattern={pattern}.")
+        patterns = [
+            f"pt:{QUOTE}:p:*",
+            "prices:*",
+            "alerted:*",
+            "rank_prev_ts:*",
+        ]
+        total_deleted = 0
+        for pat in patterns:
+            batch = []
+            # scan_iter لتفادي block
+            for k in r.scan_iter(pat, count=1000):
+                batch.append(k)
+                if len(batch) >= 500:
+                    # UNLINK أسرع/لا يحجب إذا متاح، وإلا DELETE
+                    try:
+                        r.unlink(*batch)
+                    except Exception:
+                        r.delete(*batch)
+                    total_deleted += len(batch)
+                    print(f"[INIT] Deleted {len(batch)} keys (pattern={pat})")
+                    batch.clear()
+            if batch:
+                try:
+                    r.unlink(*batch)
+                except Exception:
+                    r.delete(*batch)
+                total_deleted += len(batch)
+                print(f"[INIT] Deleted {len(batch)} keys (pattern={pat})")
+        print(f"[INIT] Total deleted keys = {total_deleted}")
     except Exception as e:
-        print(f"[INIT][ERR] {e}")
+        print(f"[INIT][ERR] Redis clear failed: {type(e).__name__}: {e}")
+
+def start_workers_once():
+    global _cleared_once
+    if started.is_set(): return
+    with lock:
+        if started.is_set(): return
+
+        if CLEAR_ON_START and not _cleared_once:
+            print("[INIT] Clearing Redis prefixes on start...")
+            clear_redis_prefixes()
+            _cleared_once = True
+
+        Thread(target=poller, daemon=True).start()
+        started.set()
+        if DEBUG_LOG:
+            print("[BOOT] pump-tick poller started")
 
 if __name__ == "__main__":
     clear_old_keys()
