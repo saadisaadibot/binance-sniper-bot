@@ -236,48 +236,81 @@ def maybe_alert(base, jump_pct, price_now):
 
 # ========= العمال =========
 def poller():
+    """
+    - يجلب الأسعار bulk كل POLL_SEC ثانية
+    - يخزنها في Redis (ساعة)
+    - يكشف قفزات وفق WINDOW_SEC/PUMP_PCT
+    - يطبع عدادات وأخطاء بشكل واضح
+    """
     global last_bulk_ts, misses
     last_stats = 0
+    EXPECTED_MIN = int(os.getenv("EXPECTED_MIN", 80))  # حد أدنى متوقَّع لعدد الأزواج
+
     while True:
+        fetched = 0
         try:
             refresh_markets()
-            mp = bulk_prices()
+            mp = bulk_prices()          # dict: base -> price
             now = time.time()
-            if mp:
+
+            fetched = len(mp)
+            if fetched == 0:
+                misses += 1
+                print(f"[POLL][WARN] bulk_prices returned 0 symbols (misses={misses})")
+            else:
+                # طباعة عدد الأزواج المجلبّة + المراقَبة فعليًا
+                watchable = fetched if not symbols_all else sum(1 for b in mp if b in symbols_all)
+                print(f"[POLL] fetched={fetched} symbols | watchable={watchable}")
+
                 last_bulk_ts = now
+                redis_errors = 0
+
                 with lock:
-                    maxlen = max(20, int(WINDOW_SEC / max(POLL_SEC,1)) + 6)
+                    # نضبط طول deque حسب النافذة
+                    maxlen = max(20, int(WINDOW_SEC / max(POLL_SEC, 1)) + 6)
+
                     for base, price in mp.items():
                         if symbols_all and base not in symbols_all:
                             continue
+
+                        # تدفق محلي
                         dq = prices[base]
                         if dq.maxlen != maxlen:
                             prices[base] = dq = deque(dq, maxlen=maxlen)
                         dq.append((now, price))
-                        # خزّن في Redis (ساعة)
+
+                        # تخزين في Redis
                         try:
                             redis_store_price(base, now, price)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            redis_errors += 1
+                            print(f"[REDIS][ERR] {base}: {type(e).__name__}: {e}")
+
                         # كشف pump
                         jump = detect_pump_for(dq, now)
                         if jump is not None and jump >= PUMP_PCT:
                             maybe_alert(base, jump, price)
-            else:
-                misses += 1
 
-            if DEBUG_LOG and (time.time() - last_stats) >= STATS_EVERY_SEC:
+                if fetched < EXPECTED_MIN:
+                    print(f"[POLL][WARN] only {fetched} symbols (<{EXPECTED_MIN})")
+                if redis_errors:
+                    print(f"[REDIS] completed with {redis_errors} error(s)")
+
+            # ملخص دوري
+            if (time.time() - last_stats) >= STATS_EVERY_SEC:
                 last_stats = time.time()
                 with lock:
                     with_data = sum(1 for _, v in prices.items() if v)
-                print(f"[POLL] entries={with_data} markets={len(symbols_all)} "
-                      f"misses={misses} last_age={int(now-last_bulk_ts) if last_bulk_ts else None}")
+                age = int(now - last_bulk_ts) if last_bulk_ts else None
+                print(f"[STATS] with_data={with_data} markets_listed={len(symbols_all)} "
+                      f"misses={misses} last_age={age}s window={WINDOW_SEC}s thr={PUMP_PCT}%")
+
+                # صفّر عداد misses بعد طباعة الملخص
                 misses = 0
 
-        except Exception:
-            if DEBUG_LOG:
-                print("[POLL][ERR]")
-                traceback.print_exc()
+        except Exception as e:
+            print(f"[POLL][ERR] {type(e).__name__}: {e}")
+            traceback.print_exc()
 
         time.sleep(POLL_SEC)
 
