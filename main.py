@@ -440,7 +440,23 @@ def telegram_webhook():
     return "ok", 200
 
 # ========= Run =========
-start_workers_once()
+
+def clear_old_keys():
+    """
+    يمسح المفاتيح القديمة الخاصة بالبوت (prices:, alerted:) 
+    لتجنب بيانات عالقة من دورات سابقة.
+    """
+    try:
+        keys = r.keys("prices:*") + r.keys("alerted:*")
+        if keys:
+            r.delete(*keys)
+            print(f"[INIT] Cleared {len(keys)} old Redis keys.")
+        else:
+            print("[INIT] No old keys found.")
+    except Exception as e:
+        print(f"[INIT][ERR] {e}")
+
 if __name__ == "__main__":
+    clear_old_keys()
     start_workers_once()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
