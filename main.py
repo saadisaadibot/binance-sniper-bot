@@ -443,16 +443,17 @@ def telegram_webhook():
 
 def clear_old_keys():
     """
-    يمسح المفاتيح القديمة الخاصة بالبوت (prices:, alerted:) 
+    يمسح المفاتيح القديمة الخاصة بالبوت (pt:{QUOTE}:p:*) 
     لتجنب بيانات عالقة من دورات سابقة.
     """
     try:
-        keys = r.keys("prices:*") + r.keys("alerted:*")
+        pattern = f"pt:{QUOTE}:p:*"
+        keys = list(r.scan_iter(pattern))
         if keys:
             r.delete(*keys)
-            print(f"[INIT] Cleared {len(keys)} old Redis keys.")
+            print(f"[INIT] Cleared {len(keys)} old Redis keys (pattern={pattern}).")
         else:
-            print("[INIT] No old keys found.")
+            print(f"[INIT] No old keys found for pattern={pattern}.")
     except Exception as e:
         print(f"[INIT][ERR] {e}")
 
