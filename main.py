@@ -14,12 +14,12 @@ BASE_URL   = os.getenv("BITVAVO_URL", "https://api.bitvavo.com/v2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", 6.0))
 
 # سرعة السحب & العتبات
-POLL_SEC   = int(os.getenv("POLL_SEC", 3))            # كل كم ثانية نجلب bulk
-WINDOW_SEC = int(os.getenv("WINDOW_SEC", 30))         # نافذة مقارنة القفزة
-PUMP_PCT   = float(os.getenv("PUMP_PCT", 6.0))        # عتبة القفزة %
+POLL_SEC   = int(os.getenv("POLL_SEC", 3))             # كل كم ثانية نجلب bulk
+WINDOW_SEC = int(os.getenv("WINDOW_SEC", 30))          # نافذة مقارنة القفزة
+PUMP_PCT   = float(os.getenv("PUMP_PCT", 6.0))         # عتبة القفزة %
 
 # منع سبام
-COOLDOWN_SEC         = int(os.getenv("COOLDOWN_SEC", 300))  # كولداون لكل عملة
+COOLDOWN_SEC         = int(os.getenv("COOLDOWN_SEC", 300))   # كولداون لكل عملة
 FLOOD_WINDOW_SEC     = int(os.getenv("FLOOD_WINDOW_SEC", 20))
 FLOOD_MAX_PER_WINDOW = int(os.getenv("FLOOD_MAX_PER_WINDOW", 6))
 DEDUP_SEC            = int(os.getenv("DEDUP_SEC", 5))
@@ -35,12 +35,13 @@ CHAT_ID   = os.getenv("CHAT_ID")
 # Redis (للساعة الماضية)
 import redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# decode_responses=True => مفاتيح/قيم سترنغ مباشرة
 r = redis.from_url(REDIS_URL, decode_responses=True)
-REDIS_TTL_SEC = int(os.getenv("REDIS_TTL_SEC", 7200))  # احتفاظ احتياطي مفتاح ساعتين
+REDIS_TTL_SEC = int(os.getenv("REDIS_TTL_SEC", 7200))  # TTL احتياطي للمفتاح
 
 # صقر (اختياري)
 SAQAR_WEBHOOK  = os.getenv("SAQAR_WEBHOOK", "")
-SAQAR_ENABLED  = os.getenv("SAQAR_ENABLED", "1") == "1"  # عطِّلها بوضع 0
+SAQAR_ENABLED  = os.getenv("SAQAR_ENABLED", "1") == "1"  # عطّلها بوضع 0
 
 # لوج
 DEBUG_LOG = os.getenv("DEBUG_LOG","0") == "1"
@@ -67,7 +68,7 @@ misses = 0
 
 # ========= Helpers =========
 def http_get(url, params=None, timeout=HTTP_TIMEOUT):
-    headers = {"User-Agent":"pump-tick/1.1"}
+    headers = {"User-Agent":"pump-tick/1.2"}
     for _ in range(2):
         try:
             return requests.get(url, params=params, timeout=timeout, headers=headers)
@@ -88,17 +89,19 @@ def redis_store_price(base, ts, price):
     key = r_key(base)
     member = f"{int(ts)}:{price}"
     # أضف النقطة واحذف الأقدم من ساعة
-    r.zadd(key, {member: ts})
-    r.zremrangebyscore(key, 0, ts - 3600)
-    r.expire(key, REDIS_TTL_SEC)
+    pipe = r.pipeline()
+    pipe.zadd(key, {member: ts})
+    pipe.zremrangebyscore(key, 0, ts - 3600)
+    pipe.expire(key, REDIS_TTL_SEC)  # تنظيف تلقائي
+    pipe.execute()
 
-def redis_hour_change(base, now_ts=None):
-    """يعيد التغير % بين أول وآخر نقطة خلال 60 دقيقة، أو None إن لم تتوفر بيانات."""
+def redis_hour_change(base):
+    """يعيد التغير % بين أول وآخر نقطة خلال 60 دقيقة، أو None إن لم تتوفر بيانات كافية."""
     key = r_key(base)
     if r.zcard(key) < 2:
         return None
-    first = r.zrange(key, 0, 0)
-    last  = r.zrevrange(key, 0, 0)
+    first = r.zrange(key, 0, 0)         # أقدم عنصر
+    last  = r.zrevrange(key, 0, 0)      # أحدث عنصر
     if not first or not last:
         return None
     try:
@@ -111,6 +114,7 @@ def redis_hour_change(base, now_ts=None):
 def trend_top_n(n=3):
     """أعلى n عملات صعودًا خلال الساعة الأخيرة (اعتمادًا على Redis)."""
     out = []
+    # استعمل قائمة الأسواق إن كانت جاهزة، وإلا امسح المفاتيح
     bases = list(symbols_all) or [k.split(":")[-1] for k in r.scan_iter(f"pt:{QUOTE}:p:*")]
     for b in bases:
         ch = redis_hour_change(b)
@@ -329,6 +333,17 @@ def telegram_webhook():
             for b, c in top:
                 lines.append(f"- {b} : {c:+.2f}%")
             send_message("\n".join(lines))
+        return "ok", 200
+    if text in {"الضبط", "/status", "status"}:
+        lines = [
+            "⚙️ Pump-Tick settings:",
+            f"- POLL_SEC = {POLL_SEC}s | WINDOW_SEC = {WINDOW_SEC}s | PUMP_PCT = {PUMP_PCT:.2f}%",
+            f"- COOLDOWN = {COOLDOWN_SEC}s | FLOOD = {FLOOD_MAX_PER_WINDOW}/{FLOOD_WINDOW_SEC}s | DEDUP = {DEDUP_SEC}s",
+            f"- QUOTE = {QUOTE} | MARKETS_REFRESH_SEC = {MARKETS_REFRESH_SEC}s",
+            f"- Redis TTL = {REDIS_TTL_SEC}s | Redis prefix = pt:{QUOTE}:p:*",
+            f"- SAQAR: {'ON' if SAQAR_ENABLED and SAQAR_WEBHOOK else 'OFF'}"
+        ]
+        send_message("\n".join(lines))
         return "ok", 200
     return "ok", 200
 
