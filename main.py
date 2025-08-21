@@ -19,7 +19,7 @@ HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", 6.0))
 # سرعة السحب & العتبات
 POLL_SEC   = int(os.getenv("POLL_SEC", 3))        # كل كم ثانية نجلب bulk
 WINDOW_SEC = int(os.getenv("WINDOW_SEC", 20))     # نافذة مقارنة القفزة
-PUMP_PCT   = float(os.getenv("PUMP_PCT", -4.0))    # عتبة القفزة %
+PUMP_PCT   = float(os.getenv("PUMP_PCT", 4.0))    # عتبة القفزة %
 
 # منع سبام
 COOLDOWN_SEC         = int(os.getenv("COOLDOWN_SEC", 300))
