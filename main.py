@@ -468,6 +468,6 @@ def telegram_webhook():
 
 # ========= Run =========
 start_workers_once()
-if __name__ == "__main__":
+#if __name__ == "__main__":
     start_workers_once()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
