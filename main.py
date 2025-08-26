@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Fast-Scalping Learner — Bitvavo EUR pairs
-- يختار Top2 (5m) + Top2 (15m) كل دقيقة ← watchlist <= 4
-- كل 3 ثواني يفحص "تهيؤ للقفزة" ويطلق شراء وهمي
-- يراقب الصفقة 5 دقائق (قد تتمدد لـ 10 تلقائياً) بهدف +2%
-- أي هبوط ≤ -2% قبل بلوغ +2% = فشل فوري
-- يتعلم ويعدل العتبات بسرعة بعد كل صفقة
-- أوامر تلغرام: /learn_on /learn_off /learn_status /learn_summary /clear_learn
+Fast-Scalping Learner — Redis-based Top Picker (Bitvavo EUR)
+- يختار Top2 (5m=300s) + Top2 (15m=900s) من بيانات السعر المخزّنة في Redis ← watch_list <= 4
+- كل 3 ثواني: فحص "تهيؤ للقفزة" ثم إطلاق شراء وهمي عند تحقق الشروط
+- المراقبة: 5 دقائق (تتمدد تلقائياً لـ 10 دقائق إذا كان بلوغ +2% يتأخر عادةً)
+- قواعد صارمة: أول لمس -2% = فشل فوري، أول لمس +2% = نجاح فوري
+- تعلّم سريع يضبط العتبات بعد كل صفقة
+- أوامر تلغرام: /learn_on /learn_off /learn_status /learn_summary /clear_learn /stats
 """
 
 import os, time, json, math, traceback
@@ -47,7 +47,7 @@ TICK_LEARN_SEC       = 3                  # فحص التهيؤ/المراقبة
 
 TP_PCT               = float(os.getenv("TP_PCT", "2.0"))     # هدف الربح +2%
 FAIL_PCT             = float(os.getenv("FAIL_PCT", "-2.0"))  # فشل فوري -2%
-VBUY_TIMEOUT_BASE    = 5 * 60            # 5 دقائق (ديناميكيًا قد يصبح 10)
+VBUY_TIMEOUT_BASE    = 5 * 60            # 5 دقائق
 VBUY_TIMEOUT_ALT     = 10 * 60           # 10 دقائق (تمديد تلقائي)
 
 ORDERBOOK_DEPTH_LVL  = 10
@@ -79,7 +79,7 @@ consecutive_http_fail = 0
 watch_list = set()
 _last_wl_reset = 0
 
-# ========= مساعدات عامة =========
+# ========= Helpers =========
 def send_message(text: str):
     if not BOT_TOKEN or not CHAT_ID:
         print(f"[TG_DISABLED] {text}"); return
@@ -93,7 +93,7 @@ def send_message(text: str):
         print(f"[TG][ERR] {type(e).__name__}: {e}")
 
 def http_get(url, params=None, timeout=HTTP_TIMEOUT):
-    headers = {"User-Agent": "fast-learner/1.0"}
+    headers = {"User-Agent": "fast-learner/1.1"}
     delays = [0.2, 0.5, 1.0, 2.0]
     for i, d in enumerate(delays, 1):
         try:
@@ -150,6 +150,15 @@ def redis_pct_change_seconds(base, seconds):
     except Exception:
         return None
 
+def redis_count_in_last_seconds(base, seconds: int) -> int:
+    key = r_price_key(base)
+    now_ts = int(time.time())
+    from_ts = now_ts - int(seconds)
+    try:
+        return r.zcount(key, from_ts, now_ts)
+    except Exception:
+        return 0
+
 # ========= Bitvavo =========
 def refresh_markets(now=None):
     global symbols_all, last_markets_refresh
@@ -193,30 +202,35 @@ def bulk_prices():
         print(f"[BULK][ERR] {type(e).__name__}: {e}")
     return out
 
-def get_candles_change(base, interval="5m", lookback=3):
-    """تغير % بين إغلاق الآن ومتوسط إغلاقات آخر lookback شموع قبل الحالية."""
-    url = f"{BASE_URL}/markets/{base}-{QUOTE}/candles"
-    resp = http_get(url, params={"interval": interval})
-    if not resp or resp.status_code != 200: return None
-    try:
-        rows = resp.json()[-(lookback+1):]
-        closes = [float(x[4]) for x in rows]
-        if len(closes) < lookback+1: return None
-        now_c = closes[-1]; ref = sum(closes[:-1])/len(closes[:-1])
-        if ref <= 0: return None
-        return (now_c - ref)/ref*100.0
-    except Exception:
-        return None
-
-def top2_for_interval(bases, interval):
+# ========= اختيار TopN من Redis بدل شموع API =========
+def top_from_redis(bases, seconds: int, topn: int = 2, min_points: int = 3, sample_cap: int = 250):
+    """
+    يختار TopN حسب التغير % خلال آخر seconds انطلاقًا من بيانات السعر في Redis.
+    - min_points: أقل عدد نقاط ضمن النافذة حتى تُحسب عملة.
+    - sample_cap: لا تفحص أكثر من هذا العدد (تخفيف ضغط).
+    """
     scored = []
+    checked = 0
     for b in bases:
-        ch = get_candles_change(b, interval=interval, lookback=3)
+        if checked >= sample_cap:
+            break
+        if redis_count_in_last_seconds(b, seconds) < min_points:
+            continue
+        ch = redis_pct_change_seconds(b, seconds)
         if ch is not None:
             scored.append((b, ch))
+            checked += 1
+    if not scored:
+        # fallback: خُذ أول عملتين لفتح المراقبة على الأقل
+        return list(bases[:topn])
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [b for (b, _) in scored[:2]]
+    return [b for (b, _) in scored[:topn]]
 
+def top2_for_interval(bases, interval):
+    seconds = 300 if interval == "5m" else 900
+    return top_from_redis(bases, seconds=seconds, topn=2, min_points=3, sample_cap=250)
+
+# ========= دفتر أوامر/سبريد/حجم =========
 def get_orderbook_and_spread(base):
     resp = http_get(f"{BASE_URL}/book", params={"market": f"{base}-{QUOTE}", "depth": ORDERBOOK_DEPTH_LVL})
     if not resp or resp.status_code != 200: return None
@@ -227,7 +241,6 @@ def get_orderbook_and_spread(base):
         best_bid = float(bids[0][0]) if bids else None
         best_ask = float(asks[0][0]) if asks else None
         spread_pct = ((best_ask - best_bid)/best_bid*100.0) if (best_bid and best_ask and best_bid>0) else None
-        # مجموع سيولة
         def sum_pa(rows):
             s = 0.0
             for row in rows:
@@ -258,7 +271,6 @@ def get_last_price(base):
     p = redis_last_price(base)
     if p is not None:
         return p
-    # fallback API
     mp = bulk_prices()
     return mp.get(base)
 
@@ -287,8 +299,8 @@ def bump_param(k, delta, lo, hi):
 def adapt_on_result(win: bool):
     # أرباح ⇒ رفع صرامة طفيفة (تقليل إشارات زائفة)
     step = 0.04 if win else -0.04
-    bump_param("r20s_thr", step,   0.10, 0.80)
-    bump_param("r60s_thr", step*1.2, 0.30, 2.00)
+    bump_param("r20s_thr", step,      0.10, 0.80)
+    bump_param("r60s_thr", step*1.2,  0.30, 2.00)
     bump_param("spread_max", -step*0.6, 0.12, 0.80)
     bump_param("ob_imb_min", step*0.8, 1.10, 3.50)
     bump_param("vol_z_min",  step*0.8, 1.10, 4.00)
@@ -311,11 +323,13 @@ def selector_worker():
                 with lock:
                     watch_list.clear()
                 _last_wl_reset = now
-            print(f"[DEBUG] selecting from {len(bases)} bases")
+
+            print(f"[DEBUG] selecting from {len(bases)} bases (redis-based)")
             top5  = top2_for_interval(bases, "5m")
             top15 = top2_for_interval(bases, "15m")
             print(f"[DEBUG] top5={top5}, top15={top15}")
-            # دمج (الأولوية لـ 15m ثم 5m) إلى حد 4
+
+            # دمج (أولوية 15m)
             ordered = top15 + [b for b in top5 if b not in top15]
             final = []
             for b in ordered:
@@ -376,12 +390,10 @@ def compute_dynamic_timeout():
         wins = []
         for raw in r.lrange("fl:trades", 0, 49):
             x = json.loads(raw)
-            if x.get("win"):
-                if x.get("dur_s"):
-                    wins.append(x["dur_s"])
+            if x.get("win") and x.get("dur_s"):
+                wins.append(x["dur_s"])
         if not wins: return VBUY_TIMEOUT_BASE
         avg = sum(wins)/len(wins)
-        # لو متوسط زمن الفوز > 240s نسمح بتمديد 10 دقائق
         return VBUY_TIMEOUT_ALT if avg > 240 else VBUY_TIMEOUT_BASE
     except Exception:
         return VBUY_TIMEOUT_BASE
@@ -391,20 +403,11 @@ def launch_virtual_buy(base, entry_price, feats):
     if r.exists(key):  # لا نكرر على نفس العملة
         return False
     timeout_sec = compute_dynamic_timeout()
-    payload = {
-        "base": base,
-        "entry_price": entry_price,
-        "entry_ts": int(time.time()),
-        "timeout_sec": timeout_sec,
-        "min_pnl": 0.0,      # أدنى PnL شوهد
-        "max_pnl": 0.0,      # أعلى PnL شوهد
-        "feats": feats
-    }
     try:
         r.hset(key, mapping={
             "base": base,
             "entry_price": entry_price,
-            "entry_ts": payload["entry_ts"],
+            "entry_ts": int(time.time()),
             "timeout_sec": timeout_sec,
             "min_pnl": 0.0,
             "max_pnl": 0.0,
@@ -436,12 +439,9 @@ def log_and_adapt(base, entry_price, exit_price, reason, win_flag, dur_s, min_pn
     try:
         r.lpush("fl:trades", json.dumps(rec))
         r.ltrim("fl:trades", 0, 499)
-        # coin stats
         hk = f"fl:coin:{base}:stats"
-        if win_flag:
-            r.hincrby(hk, "wins", 1)
-        else:
-            r.hincrby(hk, "losses", 1)
+        if win_flag: r.hincrby(hk, "wins", 1)
+        else:        r.hincrby(hk, "losses", 1)
         r.hset(hk, "last_seen", int(time.time()))
         if win_flag and dur_s:
             old = r.hget(hk, "avg_time_to_2")
@@ -458,7 +458,6 @@ def log_and_adapt(base, entry_price, exit_price, reason, win_flag, dur_s, min_pn
         f"| سبب: {reason} | min={min_pnl:+.2f}% max={max_pnl:+.2f}%"
     )
 
-    # ملخص آخر 10
     try:
         items = [json.loads(x) for x in r.lrange("fl:trades", 0, 9)]
         if items:
@@ -479,7 +478,6 @@ def close_virtual_trade(base, exit_price, reason, win_flag):
     min_pnl     = float(r.hget(key, "min_pnl") or 0.0)
     max_pnl     = float(r.hget(key, "max_pnl") or 0.0)
     dur_s       = int(time.time()) - entry_ts if entry_ts else None
-
     log_and_adapt(base, entry_price, exit_price, reason, win_flag, dur_s, min_pnl, max_pnl)
     try: r.delete(key)
     except Exception: pass
@@ -487,27 +485,31 @@ def close_virtual_trade(base, exit_price, reason, win_flag):
 # ========= كاشف “تهيؤ للقفزة” =========
 def readiness_and_maybe_launch(base):
     params = load_params()
-    # تسارع قصير باستخدام Redis
-    r20s = redis_pct_change_seconds(base, 20)   # ~ 20s
-    r60s = redis_pct_change_seconds(base, 60)   # ~ 60s
+    r20s = redis_pct_change_seconds(base, 20)   # ~ 20s momentum
+    r60s = redis_pct_change_seconds(base, 60)   # ~ 60s momentum
     ob   = get_orderbook_and_spread(base) or {}
     volz = vol_1m_vs_5m(base)
     price= get_last_price(base)
-
     if price is None: return
 
-    checks = []
-    if r20s is not None: checks.append(r20s >= params["r20s_thr"])
-    if r60s is not None: checks.append(r60s >= params["r60s_thr"])
-    if ob.get("spread_pct") is not None: checks.append(ob["spread_pct"] <= params["spread_max"])
-    if ob.get("ob_imb") is not None:     checks.append(ob["ob_imb"] >= params["ob_imb_min"])
-    if volz is not None:                 checks.append(volz >= params["vol_z_min"])
+    # نظام نقاط: نحتاج زخم (r20s أو r60s) + مجموع ≥ 3 من 5 شروط
+    score = 0; momentum_ok = False
+    if r20s is not None and r20s >= params["r20s_thr"]:
+        score += 1; momentum_ok = True
+    if r60s is not None and r60s >= params["r60s_thr"]:
+        score += 1; momentum_ok = True
+    if ob.get("spread_pct") is not None and ob["spread_pct"] <= params["spread_max"]:
+        score += 1
+    if ob.get("ob_imb") is not None and ob["ob_imb"] >= params["ob_imb_min"]:
+        score += 1
+    if volz is not None and volz >= params["vol_z_min"]:
+        score += 1
 
-    if checks and all(checks):
+    if momentum_ok and score >= 3:
         feats = {
             "r20s": r20s, "r60s": r60s,
             "spread": ob.get("spread_pct"), "ob_imb": ob.get("ob_imb"),
-            "vol_z": volz
+            "vol_z": volz, "score": score
         }
         launch_virtual_buy(base, price, feats)
 
@@ -545,21 +547,20 @@ def learner_worker():
 
                 pnl = (price - entry_price)/entry_price*100.0
 
-                # حدث الإحصاء اللحظي min/max
-                new_min = min(min_pnl, pnl) if min_pnl or min_pnl == 0 else pnl
-                new_max = max(max_pnl, pnl) if max_pnl or max_pnl == 0 else pnl
+                # تحديث أدنى/أعلى PnL مشاهَد
+                new_min = pnl if (min_pnl == 0.0 and max_pnl == 0.0) else min(min_pnl, pnl)
+                new_max = pnl if (min_pnl == 0.0 and max_pnl == 0.0) else max(max_pnl, pnl)
                 r.hset(key, mapping={"min_pnl": new_min, "max_pnl": new_max})
 
-                # قاعدة النجاح/الفشل:
-                # 1) أول ما يلمس -2% → فشل فوري
+                # 1) أول لمسة -2% → فشل
                 if pnl <= FAIL_PCT:
                     close_virtual_trade(base, price, f"FAIL {FAIL_PCT:.1f}% touch", win_flag=False)
                     continue
-                # 2) إذا وصل +2% قبل ملامسة -2% → نجاح
+                # 2) أول لمسة +2% → نجاح
                 if pnl >= TP_PCT:
                     close_virtual_trade(base, price, f"TP +{TP_PCT:.1f}%", win_flag=True)
                     continue
-                # 3) انتهاء الوقت → فشل (timeout)
+                # 3) انتهاء الوقت → فشل
                 if (int(time.time()) - entry_ts) >= timeout_sec:
                     close_virtual_trade(base, price, "timeout", win_flag=False)
                     continue
@@ -585,7 +586,7 @@ def health():
     return f"Fast-Scalping Learner (quote={QUOTE}) ✅", 200
 
 @app.get("/stats")
-def stats():
+def stats_api():
     with lock:
         wl = list(watch_list)
     p = load_params()
@@ -648,6 +649,26 @@ def telegram_webhook():
         send_message(f"🧹 تم مسح {n} مفتاح/مفاتيح تخص التعلم.")
         return "ok", 200
 
+    if text in {"/stats", "stats", "حالة"}:
+        try:
+            with lock:
+                wl = list(watch_list)
+            p = load_params()
+            age = (time.time()-last_bulk_ts) if last_bulk_ts else None
+            active_cnt = len(list(r.scan_iter("fl:active:*", count=200)))
+            lines = [
+                "📟 Stats:",
+                f"- watch_list: {wl if wl else '[]'}",
+                f"- active_virtual: {active_cnt}",
+                f"- last_bulk_age: {int(age) if age is not None else 'NA'}s",
+                f"- r20s_thr={p['r20s_thr']:.3f}% | r60s_thr={p['r60s_thr']:.3f}% | spread_max={p['spread_max']:.3f}%",
+                f"- ob_imb_min={p['ob_imb_min']:.2f} | vol_z_min={p['vol_z_min']:.2f}",
+            ]
+            send_message("\n".join(lines))
+        except Exception as e:
+            send_message(f"ERR /stats: {type(e).__name__}: {e}")
+        return "ok", 200
+
     return "ok", 200
 
 # ========= تشغيل العمّال =========
@@ -662,7 +683,6 @@ def start_workers_once():
         print("[BOOT] workers started")
 
 start_workers_once()
-# إذا تشغّل داخل بيئة WSGI (Railway) سيُستدعى تلقائياً
-# لو أردت التشغيل محلياً أزل التعليق:
+# للتشغيل المحلي:
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
