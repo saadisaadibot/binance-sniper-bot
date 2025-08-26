@@ -311,10 +311,10 @@ def selector_worker():
                 with lock:
                     watch_list.clear()
                 _last_wl_reset = now
-
+            print(f"[DEBUG] selecting from {len(bases)} bases")
             top5  = top2_for_interval(bases, "5m")
             top15 = top2_for_interval(bases, "15m")
-
+            print(f"[DEBUG] top5={top5}, top15={top15}")
             # دمج (الأولوية لـ 15m ثم 5m) إلى حد 4
             ordered = top15 + [b for b in top5 if b not in top15]
             final = []
