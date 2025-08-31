@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Fast-Scalping Learner — Redis-based Top Picker (Bitvavo EUR)
-- يختار Top2 (5m=300s) + Top2 (15m=900s) من بيانات السعر المخزّنة في Redis ← watch_list <= 4
-- كل 3 ثواني: فحص "تهيؤ للقفزة" ثم إطلاق شراء وهمي عند تحقق الشروط
-- المراقبة: 5 دقائق (تتمدد تلقائياً لـ 10 دقائق إذا كان بلوغ +2% يتأخر عادةً)
-- قواعد صارمة: أول لمس -2% = فشل فوري، أول لمس +2% = نجاح فوري
-- تعلّم سريع يضبط العتبات بعد كل صفقة
-- أوامر تلغرام: /learn_on /learn_off /learn_status /learn_summary /clear_learn /stats
+Fast-Scalping Learner — Redis-based Top Picker (Bitvavo EUR)  v1.2
+إصلاحات: شموع Bitvavo، فلترة الأسواق، تخفيف شروط الإطلاق، تشخيص سريع، وضع هجومي.
 """
 
 import os, time, json, math, traceback
@@ -36,30 +31,36 @@ REDIS_TTL_SEC   = int(os.getenv("REDIS_TTL_SEC", 7200))
 # سحب الأسعار العام (لتغذية Redis)
 POLL_SEC            = int(os.getenv("POLL_SEC", 3))
 MARKETS_REFRESH_SEC = int(os.getenv("MARKETS_REFRESH_SEC", 120))
-EXPECTED_MIN        = int(os.getenv("EXPECTED_MIN", 80))
 UNHEALTHY_THRESHOLD = int(os.getenv("UNHEALTHY_THRESHOLD", 6))
 
-# ========= إعدادات التعلم (سكالب سريع) =========
+# ========= إعدادات التعلم =========
 LEARN_ENABLED        = os.getenv("LEARN_ENABLED", "1") == "1"
-SELECT_EVERY_SEC     = 60                 # اختيار Top2/5m + Top2/15m كل دقيقة
-FULL_RESET_EVERY_SEC = 15 * 60            # كل ربع ساعة إعادة اختيار كاملة
-TICK_LEARN_SEC       = 3                  # فحص التهيؤ/المراقبة كل 3 ثواني
+SELECT_EVERY_SEC     = 60
+FULL_RESET_EVERY_SEC = 15 * 60
+TICK_LEARN_SEC       = 3
 
-TP_PCT               = float(os.getenv("TP_PCT", "2.0"))     # هدف الربح +2%
-FAIL_PCT             = float(os.getenv("FAIL_PCT", "-2.0"))  # فشل فوري -2%
-VBUY_TIMEOUT_BASE    = 5 * 60            # 5 دقائق
-VBUY_TIMEOUT_ALT     = 10 * 60           # 10 دقائق (تمديد تلقائي)
+TP_PCT               = float(os.getenv("TP_PCT", "2.0"))
+FAIL_PCT             = float(os.getenv("FAIL_PCT", "-2.0"))
+VBUY_TIMEOUT_BASE    = 5 * 60
+VBUY_TIMEOUT_ALT     = 10 * 60
 
 ORDERBOOK_DEPTH_LVL  = 10
 
+# وضع هجومي يرخّي الحدود تلقائيًا إذا ما صار ولا صفقة
+AGGRESSIVE           = os.getenv("AGGRESSIVE", "0") == "1"
+AGGR_IDLE_MIN        = int(os.getenv("AGGR_IDLE_MIN", "360"))  # إذا 6 ساعات بلا أي صفقة → رخِّ الحدود
+
 # عتبات أولية قابلة للتكيّف (تُحفظ في Redis)
 DEFAULT_PARAMS = {
-    "r20s_thr":   0.30,   # تسارع 20s %
-    "r60s_thr":   0.70,   # تسارع 60s %
-    "spread_max": 0.40,   # سبريد أقصى %
-    "ob_imb_min": 1.50,   # مجموع bids / asks
-    "vol_z_min":  1.70    # حجم 1m/متوسط 5m
+    "r20s_thr":   0.30,   # %
+    "r60s_thr":   0.70,   # %
+    "spread_max": 0.40,   # %
+    "ob_imb_min": 1.50,   # ratio
+    "vol_z_min":  1.70    # v1m / avg(5m-1)
 }
+
+# كم شرط إضافي نحتاجه فوق شرط الزخم (قابل للتعديل من env)
+REQUIRED_EXTRA_SIG = int(os.getenv("REQUIRED_EXTRA_SIG", "2"))  # بدل 3 كانت شديدة
 
 # ========= حالة =========
 lock   = Lock()
@@ -68,10 +69,9 @@ learn_running = Event()
 if LEARN_ENABLED:
     learn_running.set()
 
-symbols_all = []            # bases المتاحة للتداول مقابل QUOTE
+symbols_all = []            # جميع الأسواق مقابل QUOTE
 last_markets_refresh = 0
 
-# تاريخ أسعار محلي خفيف + Redis ZSET
 prices_local = defaultdict(lambda: deque(maxlen=128))
 last_bulk_ts = 0
 consecutive_http_fail = 0
@@ -93,7 +93,7 @@ def send_message(text: str):
         print(f"[TG][ERR] {type(e).__name__}: {e}")
 
 def http_get(url, params=None, timeout=HTTP_TIMEOUT):
-    headers = {"User-Agent": "fast-learner/1.1"}
+    headers = {"User-Agent": "fast-learner/1.2"}
     delays = [0.2, 0.5, 1.0, 2.0]
     for i, d in enumerate(delays, 1):
         try:
@@ -120,7 +120,7 @@ def redis_store_price(base, ts, price):
     member = f"{int(ts)}:{price}"
     pipe = r.pipeline()
     pipe.zadd(key, {member: ts})
-    pipe.zremrangebyscore(key, 0, ts - 3600)  # نحتفظ بساعة
+    pipe.zremrangebyscore(key, 0, ts - 3600)
     pipe.expire(key, REDIS_TTL_SEC)
     pipe.execute()
 
@@ -161,6 +161,7 @@ def redis_count_in_last_seconds(base, seconds: int) -> int:
 
 # ========= Bitvavo =========
 def refresh_markets(now=None):
+    """جلب قائمة الأسواق (لا نستبعد التي تحتوي أرقام)."""
     global symbols_all, last_markets_refresh
     now = now or time.time()
     if symbols_all and (now - last_markets_refresh) < MARKETS_REFRESH_SEC:
@@ -174,8 +175,8 @@ def refresh_markets(now=None):
         for m in data:
             if m.get("quote") == QUOTE and m.get("status") == "trading":
                 base = m.get("base")
-                if base and base.isalpha():
-                    bases.append(base)
+                if base:
+                    bases.append(base)   # FIX-2: لا isalpha()
         with lock:
             symbols_all = bases
             last_markets_refresh = now
@@ -202,38 +203,31 @@ def bulk_prices():
         print(f"[BULK][ERR] {type(e).__name__}: {e}")
     return out
 
-# ========= اختيار TopN من Redis بدل شموع API =========
-def top_from_redis(bases, seconds: int, topn: int = 2, min_points: int = 3, sample_cap: int = 250):
-    """
-    يختار TopN حسب التغير % خلال آخر seconds انطلاقًا من بيانات السعر في Redis.
-    - min_points: أقل عدد نقاط ضمن النافذة حتى تُحسب عملة.
-    - sample_cap: لا تفحص أكثر من هذا العدد (تخفيف ضغط).
-    """
+# ========= اختيار TopN من Redis =========
+def top_from_redis(bases, seconds: int, topn: int = 2, min_points: int = 3, sample_cap: int = 300):
     scored = []
     checked = 0
     for b in bases:
-        if checked >= sample_cap:
-            break
+        if checked >= sample_cap: break
         if redis_count_in_last_seconds(b, seconds) < min_points:
             continue
         ch = redis_pct_change_seconds(b, seconds)
+        checked += 1
         if ch is not None:
             scored.append((b, ch))
-            checked += 1
     if not scored:
-        # fallback: خُذ أول عملتين لفتح المراقبة على الأقل
         return list(bases[:topn])
     scored.sort(key=lambda x: x[1], reverse=True)
     return [b for (b, _) in scored[:topn]]
 
 def top2_for_interval(bases, interval):
     seconds = 300 if interval == "5m" else 900
-    return top_from_redis(bases, seconds=seconds, topn=2, min_points=3, sample_cap=250)
+    return top_from_redis(bases, seconds=seconds, topn=2, min_points=3, sample_cap=300)
 
 # ========= دفتر أوامر/سبريد/حجم =========
 def get_orderbook_and_spread(base):
     resp = http_get(f"{BASE_URL}/book", params={"market": f"{base}-{QUOTE}", "depth": ORDERBOOK_DEPTH_LVL})
-    if not resp or resp.status_code != 200: return None
+    if not resp or resp.status_code != 200: return {}
     try:
         data = resp.json()
         bids = data.get("bids", [])[:ORDERBOOK_DEPTH_LVL]
@@ -252,10 +246,11 @@ def get_orderbook_and_spread(base):
         ob_imb = (sum_bids/sum_asks) if (sum_bids>0 and sum_asks>0) else None
         return {"best_bid": best_bid, "best_ask": best_ask, "spread_pct": spread_pct, "ob_imb": ob_imb}
     except Exception:
-        return None
+        return {}
 
 def vol_1m_vs_5m(base):
-    resp = http_get(f"{BASE_URL}/markets/{base}-{QUOTE}/candles", params={"interval": "1m"})
+    """ FIX-1: مسار صحيح لشموع Bitvavo. """
+    resp = http_get(f"{BASE_URL}/candles", params={"market": f"{base}-{QUOTE}", "interval": "1m"})
     if not resp or resp.status_code != 200: return None
     try:
         rows = resp.json()[-6:]  # آخر 6 دقائق
@@ -285,6 +280,20 @@ def load_params():
                     params[k] = float(v)
     except Exception:
         pass
+
+    # وضع هجومي إذا بقالنا فترة طويلة بلا صفقات
+    if AGGRESSIVE:
+        try:
+            last_trade_ts = int(json.loads(r.lindex("fl:trades", 0) or '{"t":0}')["t"])
+        except Exception:
+            last_trade_ts = 0
+        idle_s = (time.time() - last_trade_ts) if last_trade_ts else 10**9
+        if idle_s > AGGR_IDLE_MIN * 60:
+            params["r20s_thr"]   = max(0.10, params["r20s_thr"] - 0.05)
+            params["r60s_thr"]   = max(0.30, params["r60s_thr"] - 0.08)
+            params["spread_max"] = min(0.80, params["spread_max"] + 0.10)
+            params["ob_imb_min"] = max(1.10, params["ob_imb_min"] - 0.10)
+            params["vol_z_min"]  = max(1.10, params["vol_z_min"] - 0.10)
     return params
 
 def bump_param(k, delta, lo, hi):
@@ -297,7 +306,6 @@ def bump_param(k, delta, lo, hi):
         return None
 
 def adapt_on_result(win: bool):
-    # أرباح ⇒ رفع صرامة طفيفة (تقليل إشارات زائفة)
     step = 0.04 if win else -0.04
     bump_param("r20s_thr", step,      0.10, 0.80)
     bump_param("r60s_thr", step*1.2,  0.30, 2.00)
@@ -347,7 +355,7 @@ def selector_worker():
             print(f"[SELECT][ERR] {type(e).__name__}: {e}")
         time.sleep(SELECT_EVERY_SEC)
 
-# ========= عامل سحب الأسعار العام (يغذي Redis + local) =========
+# ========= عامل سحب الأسعار العام =========
 def poller():
     global last_bulk_ts, consecutive_http_fail
     while True:
@@ -385,7 +393,6 @@ def poller():
 def active_key(base): return f"fl:active:{base}"
 
 def compute_dynamic_timeout():
-    """يمدّد إلى 10 دقائق إذا اتضح أن الوصول لـ +2% يتأخر عادةً."""
     try:
         wins = []
         for raw in r.lrange("fl:trades", 0, 49):
@@ -424,7 +431,7 @@ def launch_virtual_buy(base, entry_price, feats):
         f"spr={feats.get('spread') and round(feats['spread'],3)} "
         f"imb={feats.get('ob_imb') and round(feats['ob_imb'],2)} "
         f"volZ={feats.get('vol_z') and round(feats['vol_z'],2)} "
-        f"⏱ {timeout_sec//60}m"
+        f"score={feats.get('score')} ⏱ {timeout_sec//60}m"
     )
     return True
 
@@ -483,35 +490,58 @@ def close_virtual_trade(base, exit_price, reason, win_flag):
     except Exception: pass
 
 # ========= كاشف “تهيؤ للقفزة” =========
-def readiness_and_maybe_launch(base):
+def readiness_and_maybe_launch(base, debug=False):
     params = load_params()
     r20s = redis_pct_change_seconds(base, 20)   # ~ 20s momentum
     r60s = redis_pct_change_seconds(base, 60)   # ~ 60s momentum
     ob   = get_orderbook_and_spread(base) or {}
-    volz = vol_1m_vs_5m(base)
+    volz = vol_1m_vs_5m(base)  # قد يرجع None أحيانًا
     price= get_last_price(base)
-    if price is None: return
+    if price is None:
+        if debug: send_message(f"ℹ️ {base}: price=None")
+        return
 
-    # نظام نقاط: نحتاج زخم (r20s أو r60s) + مجموع ≥ 3 من 5 شروط
-    score = 0; momentum_ok = False
+    score = 0; momentum_ok = False; reasons = []
     if r20s is not None and r20s >= params["r20s_thr"]:
         score += 1; momentum_ok = True
+    else:
+        reasons.append(f"r20<{params['r20s_thr']:.2f}%")
+
     if r60s is not None and r60s >= params["r60s_thr"]:
         score += 1; momentum_ok = True
+    else:
+        reasons.append(f"r60<{params['r60s_thr']:.2f}%")
+
     if ob.get("spread_pct") is not None and ob["spread_pct"] <= params["spread_max"]:
         score += 1
+    else:
+        reasons.append("spread")
+
     if ob.get("ob_imb") is not None and ob["ob_imb"] >= params["ob_imb_min"]:
         score += 1
+    else:
+        reasons.append("imb")
+
+    # FIX-4: اعتبر volZ اختياري؛ لا يمنع الإطلاق إذا باقي الشروط كافية
     if volz is not None and volz >= params["vol_z_min"]:
         score += 1
+    else:
+        reasons.append("volZ")
 
-    if momentum_ok and score >= 3:
+    needed = 1 + REQUIRED_EXTRA_SIG  # 1 للزخم + عدد الشروط الإضافية
+    if momentum_ok and score >= needed:
         feats = {
             "r20s": r20s, "r60s": r60s,
             "spread": ob.get("spread_pct"), "ob_imb": ob.get("ob_imb"),
             "vol_z": volz, "score": score
         }
         launch_virtual_buy(base, price, feats)
+    elif debug:
+        send_message(f"🧪 {base}: no-go | score={score}/{needed} | "
+                     f"r20={r20s and round(r20s,3)} r60={r60s and round(r60s,3)} "
+                     f"spr={ob.get('spread_pct') and round(ob['spread_pct'],3)} "
+                     f"imb={ob.get('ob_imb') and round(ob['ob_imb'],2)} volZ={volz and round(volz,2)} | "
+                     f"miss={','.join(reasons[:3])}")
 
 # ========= عامل التعلم/المراقبة =========
 def learner_worker():
@@ -526,12 +556,10 @@ def learner_worker():
                 time.sleep(0.2); continue
             last_tick = now
 
-            # محاولات إطلاق
             wl = list(watch_list)
             for b in wl:
                 readiness_and_maybe_launch(b)
 
-            # مراقبة الصفقات النشطة
             for key in r.scan_iter("fl:active:*", count=200):
                 base = key.split(":")[-1]
                 entry_price = float(r.hget(key, "entry_price") or 0)
@@ -547,23 +575,16 @@ def learner_worker():
 
                 pnl = (price - entry_price)/entry_price*100.0
 
-                # تحديث أدنى/أعلى PnL مشاهَد
                 new_min = pnl if (min_pnl == 0.0 and max_pnl == 0.0) else min(min_pnl, pnl)
                 new_max = pnl if (min_pnl == 0.0 and max_pnl == 0.0) else max(max_pnl, pnl)
                 r.hset(key, mapping={"min_pnl": new_min, "max_pnl": new_max})
 
-                # 1) أول لمسة -2% → فشل
                 if pnl <= FAIL_PCT:
-                    close_virtual_trade(base, price, f"FAIL {FAIL_PCT:.1f}% touch", win_flag=False)
-                    continue
-                # 2) أول لمسة +2% → نجاح
+                    close_virtual_trade(base, price, f"FAIL {FAIL_PCT:.1f}% touch", win_flag=False); continue
                 if pnl >= TP_PCT:
-                    close_virtual_trade(base, price, f"TP +{TP_PCT:.1f}%", win_flag=True)
-                    continue
-                # 3) انتهاء الوقت → فشل
+                    close_virtual_trade(base, price, f"TP +{TP_PCT:.1f}%", win_flag=True); continue
                 if (int(time.time()) - entry_ts) >= timeout_sec:
-                    close_virtual_trade(base, price, "timeout", win_flag=False)
-                    continue
+                    close_virtual_trade(base, price, "timeout", win_flag=False); continue
 
         except Exception as e:
             print(f"[LEARN][ERR] {type(e).__name__}: {e}")
@@ -590,12 +611,16 @@ def stats_api():
     with lock:
         wl = list(watch_list)
     p = load_params()
+    age = (time.time()-last_bulk_ts) if last_bulk_ts else None
+    active_cnt = len(list(r.scan_iter("fl:active:*", count=200)))
     return jsonify({
         "watch_list": wl,
         "params": p,
-        "last_bulk_age": (time.time()-last_bulk_ts) if last_bulk_ts else None,
+        "last_bulk_age": int(age) if age is not None else None,
+        "active_virtual": active_cnt,
         "tick_sec": TICK_LEARN_SEC,
-        "tp_pct": TP_PCT, "fail_pct": FAIL_PCT
+        "tp_pct": TP_PCT, "fail_pct": FAIL_PCT,
+        "required_extra": REQUIRED_EXTRA_SIG
     }), 200
 
 # ========= تلغرام Webhook =========
@@ -616,14 +641,16 @@ def telegram_webhook():
         send_message("🛑 تم إيقاف التعلم.")
         return "ok", 200
 
-    if text in {"الضبط تعلم", "/learn_status"}:
+    if text in {"الضبط تعلم", "ضبط التعلم", "/learn_status"}:
         p = load_params()
         with lock: wl = list(watch_list)
+        age = (time.time()-last_bulk_ts) if last_bulk_ts else None
         lines = [
             "⚙️ Learn-Params:",
             f"- r20s_thr={p['r20s_thr']:.3f}% | r60s_thr={p['r60s_thr']:.3f}%",
             f"- spread_max={p['spread_max']:.3f}% | ob_imb_min={p['ob_imb_min']:.2f} | vol_z_min={p['vol_z_min']:.2f}",
-            f"- watch_list={wl}"
+            f"- watch_list={wl}",
+            f"- last_bulk_age={int(age) if age is not None else 'NA'}s | required_extra={REQUIRED_EXTRA_SIG}"
         ]
         send_message("\n".join(lines))
         return "ok", 200
@@ -651,8 +678,7 @@ def telegram_webhook():
 
     if text in {"/stats", "stats", "حالة"}:
         try:
-            with lock:
-                wl = list(watch_list)
+            with lock: wl = list(watch_list)
             p = load_params()
             age = (time.time()-last_bulk_ts) if last_bulk_ts else None
             active_cnt = len(list(r.scan_iter("fl:active:*", count=200)))
@@ -662,11 +688,21 @@ def telegram_webhook():
                 f"- active_virtual: {active_cnt}",
                 f"- last_bulk_age: {int(age) if age is not None else 'NA'}s",
                 f"- r20s_thr={p['r20s_thr']:.3f}% | r60s_thr={p['r60s_thr']:.3f}% | spread_max={p['spread_max']:.3f}%",
-                f"- ob_imb_min={p['ob_imb_min']:.2f} | vol_z_min={p['vol_z_min']:.2f}",
+                f"- ob_imb_min={p['ob_imb_min']:.2f} | vol_z_min={p['vol_z_min']:.2f} | required_extra={REQUIRED_EXTRA_SIG}",
             ]
             send_message("\n".join(lines))
         except Exception as e:
             send_message(f"ERR /stats: {type(e).__name__}: {e}")
+        return "ok", 200
+
+    # FIX-5: أمر تشخيص فوري يطبع أسباب الرفض
+    if text.startswith("/poke"):
+        wl = list(watch_list)
+        if not wl:
+            send_message("🧪 لا توجد قائمة مراقبة حالياً.")
+            return "ok", 200
+        for b in wl:
+            readiness_and_maybe_launch(b, debug=True)
         return "ok", 200
 
     return "ok", 200
